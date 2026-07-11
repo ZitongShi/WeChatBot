@@ -1,0 +1,21 @@
+[project]
+name = "wechat-customer-bot"
+version = "0.1.0"
+description = "Vision-assisted WeChat customer service prototype."
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=2.0.0",
+  "pillow>=12.0.0",
+  "pywin32>=312",
+  "pywinauto>=0.6.9",
+  "requests>=2.32.0",
+]
+
+[project.scripts]
+wechat-customer-bot = "wechat_customer_bot.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

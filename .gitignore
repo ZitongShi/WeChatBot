@@ -1,0 +1,9 @@
+config.json
+data/raw_wechat/
+data/screens/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.log

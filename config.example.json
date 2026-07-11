@@ -1,0 +1,23 @@
+{
+  "llm_base_url": "http://23.95.72.120:8320/v1",
+  "llm_model": "gpt-5.4-mini",
+  "vision_model": "gpt-5.4",
+  "reply_model": "gpt-5.4-mini",
+  "poll_interval_sec": 2.0,
+  "stable_seen_required": 2,
+  "min_event_confidence": 0.65,
+  "message_debounce_sec": 2.0,
+  "chat_crop": {
+    "left_ratio": 0.0,
+    "top_ratio": 0.10,
+    "right_ratio": 1.0,
+    "bottom_ratio": 0.83
+  },
+  "bottom_scan_ratio": 0.45,
+  "save_screenshots": true,
+  "activate_before_capture": true,
+  "suggest_replies": false,
+  "admin_confirm_required": true,
+  "max_recent_messages": 12,
+  "skill_path": "skills/wechat-tt-customer-service/SKILL.md"
+}
