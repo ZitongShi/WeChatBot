@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 
 from .events import ChatEvent
 
@@ -24,7 +25,7 @@ class MessageDeduper:
                 continue
             if event.confidence < self.min_confidence:
                 continue
-            fp = event.fingerprint()
+            fp = stable_event_key(event)
             state = self._seen.setdefault(fp, SeenState())
             state.count += 1
             if state.processed:
@@ -33,3 +34,8 @@ class MessageDeduper:
                 state.processed = True
                 accepted.append(event)
         return accepted
+
+
+def stable_event_key(event: ChatEvent) -> str:
+    raw = "|".join([event.role, event.type, event.normalized_text])
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
