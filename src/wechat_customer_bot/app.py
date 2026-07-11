@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from .capture import grab_window_chat, image_sha1, save_screen
@@ -14,6 +15,15 @@ from .reply import ReplyAdvisor
 from .sender import send_text_to_window
 from .vision_ocr import VisionOcr
 from .windows import activate_window, ensure_window_ready, get_window, list_windows
+
+
+@dataclass
+class WatchState:
+    deduper: MessageDeduper
+    history: list[ChatEvent] = field(default_factory=list)
+    last_hash: str = ""
+    last_new_at: float = 0.0
+    pending: list[ChatEvent] = field(default_factory=list)
 
 
 def cmd_list_windows(args: argparse.Namespace) -> int:
@@ -186,6 +196,110 @@ def cmd_watch(args: argparse.Namespace) -> int:
             time.sleep(max(config.poll_interval_sec, 3.0))
 
 
+def cmd_watch_many(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    suggest = bool(args.suggest or args.auto_send or config.suggest_replies)
+    auto_send = bool(args.auto_send)
+    logger = JsonlLogger(config.log_dir / "events.jsonl")
+    ocr = VisionOcr(config)
+    advisor = ReplyAdvisor(config)
+    states = {
+        hwnd: WatchState(MessageDeduper(config.stable_seen_required, config.min_event_confidence))
+        for hwnd in args.hwnd
+    }
+
+    for hwnd in args.hwnd:
+        info = ensure_window_ready(hwnd)
+        warn_if_main_window(info.title)
+        print(f"监听窗口 hwnd={hwnd} title={info.title!r}")
+    print(f"开始串行监听 {len(args.hwnd)} 个微信窗口。suggest={suggest} auto_send={auto_send} interval={config.poll_interval_sec}s")
+
+    while True:
+        try:
+            for hwnd in args.hwnd:
+                state = states[hwnd]
+                info = ensure_window_ready(hwnd)
+                if config.activate_before_capture:
+                    activate_window(hwnd)
+                    time.sleep(0.2)
+                    info = ensure_window_ready(hwnd)
+                image = grab_window_chat(info, config)
+                digest = image_sha1(image)
+                if digest != state.last_hash:
+                    state.last_hash = digest
+                    screen_path = ""
+                    if config.save_screenshots:
+                        screen_path = str(save_screen(image, config.data_dir / "screens", f"watch-{hwnd}"))
+                    events = ocr.extract_events(image, info.title)
+                    accepted = state.deduper.accept(events)
+                    if accepted:
+                        state.pending.extend(accepted)
+                        state.last_new_at = time.time()
+                        for event in accepted:
+                            print_event(f"NEW[{info.title}]", event)
+                            logger.write(
+                                "message_detected",
+                                hwnd=hwnd,
+                                title=info.title,
+                                role=event.role,
+                                type=event.type,
+                                text=event.normalized_text,
+                                confidence=event.confidence,
+                                screenshot=screen_path,
+                            )
+
+                if state.pending and time.time() - state.last_new_at >= config.message_debounce_sec:
+                    batch = state.pending
+                    state.pending = []
+                    state.history.extend(batch)
+                    print(f"\n合并消息[{info.title}]：")
+                    print(compact_events(batch))
+                    logger.write(
+                        "message_batch",
+                        hwnd=hwnd,
+                        title=info.title,
+                        messages=[
+                            {"role": e.role, "type": e.type, "text": e.normalized_text, "confidence": e.confidence}
+                            for e in batch
+                        ],
+                    )
+                    if suggest:
+                        decision = advisor.decide(state.history, batch, info.title)
+                        print(f"\n建议[{info.title}]：")
+                        print(f"action={decision.action} reason={decision.reason}")
+                        if decision.reply:
+                            print(decision.reply)
+                        if decision.customer_ack:
+                            print(f"ack={decision.customer_ack}")
+                        logger.write(
+                            "reply_suggested",
+                            hwnd=hwnd,
+                            title=info.title,
+                            action=decision.action,
+                            reason=decision.reason,
+                            reply=decision.reply,
+                            customer_ack=decision.customer_ack,
+                        )
+                        if auto_send and decision.action == "suggest" and decision.reply:
+                            send_text_to_window(info, decision.reply, args.input_y_ratio)
+                            state.history.append(ChatEvent(role="self", type="text", text=decision.reply, confidence=1.0))
+                            logger.write(
+                                "reply_auto_sent",
+                                hwnd=hwnd,
+                                title=info.title,
+                                reply=decision.reply,
+                            )
+                            print(f"已自动发送[{info.title}]。")
+            time.sleep(config.poll_interval_sec)
+        except KeyboardInterrupt:
+            print("\n已停止。")
+            return 0
+        except Exception as exc:
+            logger.write("watch_many_error", error=str(exc))
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 错误：{exc}", file=sys.stderr)
+            time.sleep(max(config.poll_interval_sec, 3.0))
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     info = ensure_window_ready(args.hwnd)
     warn_if_main_window(info.title)
@@ -230,6 +344,13 @@ def build_parser() -> argparse.ArgumentParser:
     watch_cmd.add_argument("--auto-send", action="store_true", help="send suggest replies automatically")
     watch_cmd.add_argument("--input-y-ratio", type=float, default=0.92)
     watch_cmd.set_defaults(func=cmd_watch)
+
+    watch_many_cmd = sub.add_parser("watch-many", help="watch multiple independent chat windows serially")
+    watch_many_cmd.add_argument("--hwnd", type=int, action="append", required=True)
+    watch_many_cmd.add_argument("--suggest", action="store_true", help="generate suggested replies")
+    watch_many_cmd.add_argument("--auto-send", action="store_true", help="send suggest replies automatically")
+    watch_many_cmd.add_argument("--input-y-ratio", type=float, default=0.92)
+    watch_many_cmd.set_defaults(func=cmd_watch_many)
 
     send_cmd = sub.add_parser("send", help="manually send text to a specified WeChat window")
     send_cmd.add_argument("--hwnd", type=int, required=True)

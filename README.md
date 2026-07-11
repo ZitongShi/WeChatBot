@@ -33,6 +33,14 @@ python -m wechat_customer_bot watch --hwnd 132854 --auto-send
 
 Only `suggest` decisions are sent. `ignore` and `handoff` decisions are never auto-sent.
 
+For multiple windows, use one serial watcher instead of starting multiple `watch` processes:
+
+```powershell
+python -m wechat_customer_bot watch-many --hwnd 4329172 --hwnd 2362606 --auto-send
+```
+
+This avoids concurrent window activation and reduces the chance of reading the wrong window.
+
 ## Skill
 
 The reply advisor loads:
