@@ -1,7 +1,7 @@
 [project]
-name = "wechat-customer-bot"
+name = "wechat-chat-proxy"
 version = "0.1.0"
-description = "Vision-assisted WeChat customer service prototype."
+description = "Vision-assisted WeChat daily chat proxy prototype."
 requires-python = ">=3.11"
 dependencies = [
   "openai>=2.0.0",
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-wechat-customer-bot = "wechat_customer_bot.app:main"
+wechat-chat-proxy = "wechat_customer_bot.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -1,6 +1,6 @@
 # WeChatCustomerBot
 
-Windows desktop WeChat vision-assisted customer service prototype.
+Windows desktop WeChat vision-assisted daily chat proxy prototype.
 
 This first version is intentionally read-only by default:
 
@@ -8,9 +8,9 @@ This first version is intentionally read-only by default:
 - It screenshots a configured chat region.
 - It uses a vision model to extract recent chat events.
 - It deduplicates messages.
-- It can generate a suggested reply.
+- It can generate a suggested daily-chat reply.
 - It can manually send text when you explicitly run the `send` command.
-- It does not auto-send customer replies.
+- It does not auto-send replies unless `--auto-send` is explicitly enabled.
 
 ## Quick Start
 
@@ -41,14 +41,14 @@ The reply advisor loads:
 E:\WeChatCustomerBot\skills\wechat-tt-customer-service\SKILL.md
 ```
 
-The current skill inherits the QQ customer-service business rules and adds WeChat visual/OCR constraints plus style notes distilled from:
+The current skill is for daily chat testing. It does not inherit the QQBot API-sales/customer-service workflow. It uses WeChat visual/OCR constraints plus style notes distilled from:
 
 - 已读不回
 - 煊
 - 叶浪
 - 鸿烨
 
-The raw exports are under `data\raw_wechat`; the distilled notes are under `data\distilled`.
+The raw exports stay local under `data\raw_wechat` and are ignored by git. The distilled notes are under `data\distilled`.
 
 ## Voice Messages
 
@@ -62,13 +62,13 @@ Automatic right-click "转文字" is not enabled yet because it needs per-window
 
 ## Safety Boundary
 
-The bot must not automatically:
+The bot should not automatically handle:
 
-- confirm payments
-- create API keys
-- recharge or modify quotas
-- send final files
-- handle refunds or compensation
-- process remote-control codes
+- transfers, payments, collections, or loan requests
+- verification codes, passwords, accounts, or private information
+- meetups, addresses, schedules, or promises with real-world consequences
+- serious emotional conflict, threats, complaints, or legal/illegal topics
+- voice messages without visible transcript
+- unclear screenshots or images
 
-High-risk events should be handed to the administrator.
+High-risk events should be handed to the human user.

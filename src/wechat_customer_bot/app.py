@@ -208,7 +208,7 @@ def warn_if_main_window(title: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="wechat-customer-bot")
+    parser = argparse.ArgumentParser(prog="wechat-chat-proxy")
     parser.add_argument("--config", default=None, help="config.json path")
     sub = parser.add_subparsers(dest="command", required=True)
 
