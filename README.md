@@ -49,12 +49,6 @@ The reply advisor loads:
 E:\WeChatCustomerBot\skills\wechat-tt-customer-service\SKILL.md
 ```
 
-The current skill is for daily chat testing. It does not inherit the QQBot API-sales/customer-service workflow. It uses WeChat visual/OCR constraints plus style notes distilled from:
-
-- 已读不回
-- 煊
-- 叶浪
-- 鸿烨
 
 The raw exports stay local under `data\raw_wechat` and are ignored by git. The distilled notes are under `data\distilled`.
 
