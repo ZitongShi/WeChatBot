@@ -1,4 +1,4 @@
-# Run the relay automatically when this (VM) user logs on.
+﻿# Run the relay automatically when this (VM) user logs on.
 #   powershell -ExecutionPolicy Bypass -File scripts\register_autostart.ps1
 # The task runs in the interactive session, because the bot needs the visible desktop.
 $root = Split-Path $PSScriptRoot -Parent

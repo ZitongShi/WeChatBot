@@ -9,6 +9,7 @@ from PIL import Image
 SESSION_LIST_BG = (238, 238, 240)
 CHAT_BG = (250, 250, 250)
 BADGE_RED = (250, 81, 81)
+SELECTED_ROW = (21, 172, 112)  # the open chat's row in the session list
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,11 @@ class Layout:
     @property
     def header_box(self) -> tuple[int, int, int, int]:
         return (self.chat_left, self.header_top, self.chat_right - 120, self.header_bottom)
+
+    @property
+    def chat_box(self) -> tuple[int, int, int, int]:
+        """Title bar plus messages: what the vision model reads in one call."""
+        return (self.chat_left, self.header_top, self.chat_right, self.input_top)
 
     @property
     def messages_box(self) -> tuple[int, int, int, int]:
@@ -54,7 +60,7 @@ class LayoutError(RuntimeError):
     pass
 
 
-def _close(color: tuple[int, int, int], target: tuple[int, int, int], tol: int) -> bool:
+def close_color(color: tuple[int, int, int], target: tuple[int, int, int], tol: int) -> bool:
     return all(abs(a - b) <= tol for a, b in zip(color, target))
 
 
@@ -62,7 +68,7 @@ def _segments(row: list[tuple[int, int, int]], target: tuple[int, int, int], min
     segs: list[tuple[int, int]] = []
     start = None
     for x, color in enumerate(row + [(-1, -1, -1)]):
-        if _close(color, target, 2):
+        if close_color(color, target, 2):
             if start is None:
                 start = x
         elif start is not None:
@@ -96,7 +102,7 @@ def detect_layout(image: Image.Image) -> Layout:
     probe_x = chat_seg[0] + 60
 
     def is_bg(y: int) -> bool:
-        return _close(px[probe_x, y], CHAT_BG, 1)
+        return close_color(px[probe_x, y], CHAT_BG, 1)
 
     def is_divider(y: int) -> bool:
         # A 1-2px uniform gray line spanning the whole chat pane.
@@ -164,7 +170,7 @@ def find_unread_rows(image: Image.Image, layout: Layout) -> list[UnreadRow]:
     mask: set[tuple[int, int]] = set()
     for y in range(y0, y1):
         for x in range(x0, x1):
-            if _close(px[x, y], BADGE_RED, 22):
+            if close_color(px[x, y], BADGE_RED, 22):
                 mask.add((x, y))
 
     rows: list[UnreadRow] = []
@@ -192,3 +198,62 @@ def find_unread_rows(image: Image.Image, layout: Layout) -> list[UnreadRow]:
         click = ((layout.list_left + layout.list_right) // 2, box[1] + 30)
         rows.append(UnreadRow(badge_box=box, click_point=click))
     return rows
+
+
+def find_list_rows(image: Image.Image, layout: Layout) -> list[int]:
+    """Vertical centers (window pixels) of the avatars in the session list, top to bottom.
+
+    The vision model names rows reliably but its boxes drift by up to ~30px, a third of a
+    row, so clicks are snapped to these instead.
+    """
+    img = image.convert("RGB")
+    px = img.load()
+    x = layout.list_left + 33  # through the middle of every avatar
+    bg_x = layout.list_left + 3  # left of the avatars: the row's own background (plain, hovered, selected)
+    top, bottom = layout.header_bottom, layout.height - 1
+
+    segments: list[list[int]] = []
+    for y in range(top, bottom):
+        if close_color(px[x, y], px[bg_x, y], 4):
+            continue
+        # Avatars can contain background-colored pixels: bridge gaps shorter than 8px.
+        if segments and y - segments[-1][1] <= 8:
+            segments[-1][1] = y + 1
+        else:
+            segments.append([y, y + 1])
+
+    centers: list[int] = []
+    for start, end in segments:
+        height = end - start
+        # Rows cut off at the top or bottom of the list show part of an avatar.
+        at_edge = start <= top + 2 or end >= layout.height - 20
+        if 30 <= height <= 60 or (at_edge and 8 <= height < 30):
+            centers.append((start + end) // 2)
+    return centers
+
+
+def snap_to_row(y: int, centers: list[int], index: int | None = None, first_y: int | None = None) -> int | None:
+    """Map a row the vision model located (its y and list position) to an avatar center.
+
+    The model's boxes drift more the further down the list, but its order is right: when
+    its first row is the first avatar, the position decides. Otherwise take the nearest
+    avatar, unless the next one is about as near (None: better to search than to click a
+    neighbour). `first_y` is the y of the first row the model listed.
+    """
+    if not centers:
+        return None
+    if (
+        index is not None
+        and first_y is not None
+        and index < len(centers)
+        and abs(centers[0] - first_y) <= 30
+        and abs(centers[index] - y) <= 70
+    ):
+        return centers[index]
+    ranked = sorted(centers, key=lambda c: abs(c - y))
+    best = ranked[0]
+    if abs(best - y) > 45:
+        return None
+    if len(ranked) > 1 and abs(ranked[1] - y) - abs(best - y) < 25:
+        return None
+    return best

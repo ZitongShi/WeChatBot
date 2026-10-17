@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from PIL import Image, ImageGrab
 import win32con
 import win32gui
-import win32ui
 
 
 PW_RENDERFULLCONTENT = 2
@@ -47,8 +46,11 @@ def window_rect(hwnd: int) -> tuple[int, int, int, int]:
     return win32gui.GetWindowRect(hwnd)
 
 
-def place_window(hwnd: int, rect: tuple[int, int, int, int]) -> None:
-    """Pin WeChat to a known geometry so it re-lays out and the rect matches what is drawn."""
+def place_window(hwnd: int, rect: tuple[int, int, int, int] | None) -> None:
+    """Maximize WeChat (rect None) or pin it to a fixed geometry, so the layout is predictable."""
+    if rect is None:
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        return
     left, top, width, height = rect
     win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
     win32gui.SetWindowPos(hwnd, 0, left, top, width, height, win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW)
@@ -66,6 +68,9 @@ def capture_window(hwnd: int) -> Image.Image:
 
 def print_window(hwnd: int) -> Image.Image:
     """Background capture via PrintWindow; kept for debugging only (can return stale frames)."""
+    # win32ui needs the MFC runtime, which a fresh Windows install does not have.
+    import win32ui
+
     left, top, right, bottom = window_rect(hwnd)
     width, height = right - left, bottom - top
     hwnd_dc = win32gui.GetWindowDC(hwnd)
@@ -139,7 +144,3 @@ def ocr_lines(image: Image.Image) -> list[OcrLine]:
             )
         )
     return lines
-
-
-def ocr_text(image: Image.Image) -> str:
-    return " ".join(line.text for line in ocr_lines(image)).strip()

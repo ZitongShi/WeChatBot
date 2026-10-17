@@ -1,10 +1,28 @@
 from PIL import Image, ImageDraw
 
-from wechat_relay.layout import BADGE_RED, CHAT_BG, SESSION_LIST_BG, detect_layout, find_unread_rows
+from wechat_relay.layout import (
+    BADGE_RED,
+    CHAT_BG,
+    SELECTED_ROW,
+    SESSION_LIST_BG,
+    detect_layout,
+    find_list_rows,
+    find_unread_rows,
+    snap_to_row,
+)
 from wechat_relay.relay import format_forward, parse_command
 from wechat_relay.store import RelayState, split_after_anchor
-from wechat_relay.ui import is_group_title, names_match, strip_member_count
-from wechat_relay.vision import ChatMessage, parse_chat_read, parse_json_object
+from wechat_relay.ui import names_match, pick_row, same_name, strip_member_count
+from wechat_relay.vision import (
+    MY_BUBBLE,
+    ChatMessage,
+    ChatRead,
+    Row,
+    fix_sides,
+    parse_chat_read,
+    parse_json_object,
+    parse_rows,
+)
 
 
 def msg(text, side="L", kind="text", sender="", quote=""):
@@ -77,7 +95,6 @@ def test_parse_chat_read_fixes_side_from_box():
 
 
 def test_title_helpers():
-    assert is_group_title("专业班子(32)") and not is_group_title("zitong")
     assert strip_member_count("专业班子（32）") == "专业班子"
     assert names_match("zitong", "zitong") and names_match("文件传输助手", "文件传输助手")
     assert not names_match("zitong", "专业班子")
@@ -103,20 +120,98 @@ def test_detect_layout_and_badges():
     assert len(rows) == 1 and rows[0].badge_box[1] == 300
 
 
-def test_pick_search_result_prefers_contact_title():
-    from wechat_relay.screen import OcrLine
-    from wechat_relay.ui import pick_search_result
+def test_list_rows_found_from_avatars_and_snapped():
+    img = synthetic_window()
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((100, 191, 349, 271), fill=SELECTED_ROW)  # the open chat's row
+    for top in (127, 208, 289):
+        draw.rectangle((110, top, 155, top + 45), fill=(90, 120, 200))
+    draw.rectangle((110, 230, 155, 233), fill=SELECTED_ROW)  # avatar pixels matching the row color
+    layout = detect_layout(img)
+    centers = find_list_rows(img, layout)
+    assert centers == [150, 231, 312]
+    assert snap_to_row(205, centers) == 231 and snap_to_row(700, centers) is None
+    assert snap_to_row(190, centers) is None  # about halfway between two rows
+    assert snap_to_row(270, centers, index=2, first_y=155) == 312  # position wins over drifted boxes
+    assert snap_to_row(270, centers, index=2, first_y=200) is None  # first rows disagree
 
-    rows = [
-        (29, 54, "联系人"), (99, 120, "zitong"), (226, 120, "专业班子"), (262, 120, "包含:zitong"),
-        (413, 54, "聊天记录"), (503, 122, "[文件]260927zitong.md"), (948, 203, "zitong"),
+
+def test_fix_sides_trusts_pixels_over_the_model():
+    img = Image.new("RGB", (640, 400), (250, 250, 250))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((150, 20, 550, 120), fill=MY_BUBBLE)  # my long green bubble, centered-ish
+    draw.rectangle((25, 150, 70, 195), fill=(140, 90, 60))  # left avatar
+    draw.rectangle((90, 150, 300, 190), fill=(255, 255, 255))  # their white file card
+    draw.rectangle((570, 250, 615, 295), fill=(200, 190, 220))  # right avatar
+    draw.rectangle((350, 250, 550, 290), fill=(255, 255, 255))  # my white file card
+    read = ChatRead(
+        is_group=False,
+        messages=[
+            ChatMessage("L", "", "text", "a", box=(140, 15, 560, 125)),
+            ChatMessage("R", "", "file", "b", box=(90, 150, 300, 190)),
+            ChatMessage("L", "", "file", "c", box=(350, 250, 550, 290)),
+            ChatMessage("C", "", "system", "d", box=(250, 330, 390, 350)),
+        ],
+    )
+    fix_sides(read, img)
+    assert [m.side for m in read.messages] == ["R", "L", "R", "C"]
+
+
+def test_parse_chat_read_title_and_group():
+    data = {"title": "专业班子", "member_count": 32, "group": False, "messages": []}
+    read = parse_chat_read(data, (100, 100))
+    assert (read.title, read.member_count, read.is_group) == ("专业班子", 32, True)
+    # The count left in the title still counts; nickname labels alone do not make a group.
+    read = parse_chat_read({"title": "专业班子（5）", "member_count": None}, (100, 100))
+    assert (read.title, read.member_count, read.is_group) == ("专业班子", 5, True)
+    read = parse_chat_read({"title": "李雷", "member_count": None, "group": True}, (100, 100))
+    assert (read.title, read.is_group) == ("李雷", False)
+
+
+def test_same_name_is_strict_but_accepts_cut_off_names():
+    assert same_name("李雷", "李雷") and same_name("zitong", " zitong ")
+    assert not same_name("李雷", "李雷楠") and not same_name("zitong", "zltong")
+    assert same_name("[UnderWay] CV group", "[UnderWay] CV...")
+    assert same_name("[UnderWay] CV group", "[UnderWay] CV…")
+    assert not same_name("[UnderWay] CV group", "[UnderWay] CV")
+    assert not same_name("李雷", "李...")  # a 1-glyph prefix is too weak
+
+
+def test_parse_rows_and_pick_row():
+    data = parse_json_object(
+        '{"rows":[{"section":"联系人","name":"李雷","box":[0,60,1000,140]},'
+        '{"section":"群聊","name":"专业班子","box":[0,180,1000,260]},'
+        '{"section":"搜索网络结果","name":"李雷","box":[0,500,1000,540]},'
+        '{"section":"聊天记录","name":"zitong","box":[0,900,1000,960]},'
+        '{"name":"","box":[0,0,1,1]},{"name":"bad","box":[0,0,1]}]}'
+    )
+    rows = parse_rows(data, (400, 600))
+    assert [r.name for r in rows] == ["李雷", "专业班子", "李雷", "zitong"]
+    assert rows[0].center == (200, 60)
+    allowed = ("联系人", "群聊", "功能", "最常使用")
+    assert pick_row(rows, "李雷", allowed).center == (200, 60)
+    assert pick_row(rows, "zitong", allowed) is None  # chat-history hits open a separate window
+    assert pick_row(rows, "zitong").section == "聊天记录"
+    assert pick_row([Row("文件传输助手", (5, 5))], "文件传输助手") is not None
+
+
+def test_split_out_quote_is_folded_into_the_reply():
+    from wechat_relay.relay import attach_split_quotes
+
+    messages = [
+        msg("/help"),
+        msg("好的收到"),
+        msg("BQ7: #1【私】李雷 ok 爸爸"),
+        msg("#2【群】专业班子 张三：开会", side="R"),
     ]
-    lines = [OcrLine(text=t, x=x, y=y, width=60, height=20) for y, x, t in rows]
-    assert pick_search_result(lines, "zitong").y == 99
-    assert pick_search_result(lines, "专业班子").y == 226
-    assert pick_search_result(lines, "马明宇") is None
-    feature = [(31, 88, "搜索网络结果"), (79, 53, "0 文件传輸助手"), (337, 57, "功能"), (403, 124, "文件传输助手"), (474, 113, "[聊天记录]")]
-    feature_lines = [OcrLine(text=t, x=x, y=y, width=60, height=20) for y, x, t in feature]
-    assert pick_search_result(feature_lines, "文件传输助手").y == 403
-    garbled = [OcrLine(text="文亻牛传输助手", x=120, y=99, width=60, height=20)]
-    assert pick_search_result(garbled, "文件传输助手") is not None
+    merged = attach_split_quotes(messages)
+    assert [m.text for m in merged] == ["/help", "好的收到", "#2【群】专业班子 张三：开会"]
+    assert parse_command(merged[1]).target_id == 1 and parse_command(merged[1]).text == "好的收到"
+
+
+def test_split_out_quote_is_recognised():
+    from wechat_relay.relay import FORWARD_QUOTE
+
+    assert FORWARD_QUOTE.search("BQ7: #1【私】李雷 ok （可能还有更早的消息未显示）")
+    assert FORWARD_QUOTE.search("#12【群】专业班子 张三：开会")
+    assert not FORWARD_QUOTE.search("#1 好的收到")

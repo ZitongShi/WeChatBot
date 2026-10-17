@@ -13,11 +13,13 @@ from PIL import Image
 
 MESSAGE_TYPES = {"text", "image", "voice", "video", "file", "link", "sticker", "system", "other"}
 
-PROMPT = """You are reading a screenshot of the message area of one WeChat desktop chat.
+PROMPT = """You are reading a screenshot of one open WeChat desktop chat: the title bar on top, the messages below.
 Return JSON only, no markdown:
-{"group": bool, "messages": [{"side": "L|R|C", "sender": str, "type": str, "text": str, "quote": str, "box": [x1,y1,x2,y2]}]}
+{"title": str, "member_count": int|null, "group": bool, "messages": [{"side": "L|R|C", "sender": str, "type": str, "text": str, "quote": str, "box": [x1,y1,x2,y2]}]}
 
 Rules:
+- title: the chat name in the title bar exactly as shown, without a trailing "(N)" member count.
+- member_count: N when the title bar shows "(N)" after the name (group chats), else null.
 - List every visible message bubble from top to bottom. Skip timestamps.
 - side: L = bubble on the left (sent by someone else), R = bubble on the right (sent by me), C = centered gray system notice.
 - group: true if small gray nickname labels appear above the left bubbles.
@@ -25,6 +27,7 @@ Rules:
 - type: one of text, image, voice, video, file, link, sticker, system, other.
 - text: exact visible text for text bubbles; file name for files; title for links; for voice, the transcript if one is shown under the bubble, else ""; a 2-6 word description for images, videos and stickers.
 - quote: if the bubble has a quoted/replied message in a gray box under it, the quoted text exactly; else "".
+  The gray quoted box belongs to the bubble above it: never output it as a message of its own.
 - box: bubble bounding box in 0-1000 coordinates relative to this screenshot, for every message.
 - Never invent text you cannot read."""
 
@@ -47,6 +50,17 @@ class ChatMessage:
 class ChatRead:
     is_group: bool
     messages: list[ChatMessage]
+    title: str = ""
+    member_count: int | None = None
+
+
+@dataclass
+class Row:
+    """A clickable row the vision model found: session-list entry or search result."""
+
+    name: str
+    center: tuple[int, int]
+    section: str = ""
 
 
 def normalize_for_match(text: str) -> str:
@@ -120,7 +134,114 @@ def parse_chat_read(data: dict[str, Any], image_size: tuple[int, int]) -> ChatRe
                 box=box,
             )
         )
-    return ChatRead(is_group=bool(data.get("group")), messages=messages)
+    title, member_count = _split_title(data.get("title"), data.get("member_count"))
+    return ChatRead(
+        # The "(N)" after a group's title is far more reliable than nickname labels.
+        is_group=member_count is not None,
+        messages=messages,
+        title=title,
+        member_count=member_count,
+    )
+
+
+MY_BUBBLE = (157, 242, 159)  # WeChat 4 green for my own text bubbles
+PANE_BG = (250, 250, 250)
+
+
+def _close(color: tuple[int, ...], target: tuple[int, int, int], tol: int) -> bool:
+    return all(abs(a - b) <= tol for a, b in zip(color, target))
+
+
+def fix_sides(read: ChatRead, image: Image.Image) -> None:
+    """Decide left/right from pixels, not from the model.
+
+    A message of mine misread as incoming would be relayed (or, in the main chat, run as a
+    command and answered by the bot itself), so the model's side is only the last resort:
+    green fill means mine, else the avatar beside the bubble's top says which side.
+    """
+    img = image.convert("RGB")
+    width, height = img.size
+    px = img.load()
+    left_x, right_x = 47, width - 49  # avatar columns
+    for message in read.messages:
+        if message.side == "C" or not message.box:
+            continue
+        x1, y1, x2, y2 = (max(0, v) for v in message.box)
+        x2, y2 = min(x2, width - 1), min(y2, height - 1)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        samples = [px[x, y] for x in range(x1, x2, 4) for y in range(y1, y2, 4)]
+        if samples and sum(_close(c, MY_BUBBLE, 12) for c in samples) >= 0.2 * len(samples):
+            message.side = "R"
+            continue
+        ys = range(max(0, y1 - 8), min(height, y1 + 40))
+        left = sum(not _close(px[left_x, y], PANE_BG, 6) for y in ys)
+        right = sum(not _close(px[right_x, y], PANE_BG, 6) for y in ys)
+        if left >= 5 and right == 0:
+            message.side = "L"
+        elif right >= 5 and left == 0:
+            message.side = "R"
+
+
+def _split_title(raw_title: Any, raw_count: Any) -> tuple[str, int | None]:
+    title = str(raw_title or "").strip()
+    count: int | None = None
+    # Models sometimes keep the count in the title despite the instructions.
+    match = re.search(r"[(（]\s*(\d+)\s*[)）]\s*$", title)
+    if match:
+        title = title[: match.start()].strip()
+        count = int(match.group(1))
+    try:
+        if raw_count is not None and int(raw_count) > 0:
+            count = int(raw_count)
+    except (TypeError, ValueError):
+        pass
+    return title, count
+
+
+def _box_center(raw_box: Any, size: tuple[int, int]) -> tuple[int, int] | None:
+    if not isinstance(raw_box, list) or len(raw_box) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in raw_box)
+    except (TypeError, ValueError):
+        return None
+    cx, cy = (x1 + x2) / 2000, (y1 + y2) / 2000
+    if not (0 <= cx <= 1 and 0 <= cy <= 1):
+        return None
+    return int(cx * size[0]), int(cy * size[1])
+
+
+def parse_rows(data: dict[str, Any], size: tuple[int, int]) -> list[Row]:
+    rows: list[Row] = []
+    for item in data.get("rows") or []:
+        if not isinstance(item, dict):
+            continue
+        center = _box_center(item.get("box"), size)
+        name = str(item.get("name") or "").strip()
+        if center and name:
+            rows.append(Row(name=name, center=center, section=str(item.get("section") or "").strip()))
+    return rows
+
+
+SESSIONS_PROMPT = """This is the session list of the WeChat desktop app: one row per chat, each with an
+avatar, a bold name, a timestamp and a gray preview line.
+Return JSON only: {"rows": [{"name": str, "box": [x1,y1,x2,y2]}]}
+- One entry per row, top to bottom, including partly visible rows at the edges.
+- name: the bold chat name exactly as shown (keep a trailing "..." if it is cut off). Never the preview text.
+- box: the whole row, in 0-1000 coordinates relative to this image."""
+
+SEARCH_PROMPT = """This is the WeChat desktop search-result popup. Results are grouped under gray section
+headers such as 联系人, 群聊, 功能, 最常使用, 搜索网络结果, 聊天记录.
+Return JSON only: {"rows": [{"section": str, "name": str, "box": [x1,y1,x2,y2]}]}
+- One entry per result row, top to bottom. section: the header the row sits under, as shown.
+- name: the row's main title exactly as shown (part of it may be green). Never the gray second line.
+- box: the whole row, in 0-1000 coordinates relative to this image."""
+
+TITLE_PROMPT = """This is the title bar of an open WeChat desktop chat.
+Return JSON only: {"title": str, "member_count": int|null}
+- title: the chat name exactly as shown, without a trailing "(N)"; "" if no chat is open.
+- member_count: N when "(N)" follows the name, else null."""
 
 
 class VisionReader:
@@ -132,16 +253,16 @@ class VisionReader:
         self.model = model
         self.timeout = timeout
 
-    def read_chat(self, image: Image.Image) -> ChatRead:
+    def _ask(self, prompt: str, image: Image.Image, max_tokens: int) -> dict[str, Any]:
         payload = {
             "model": self.model,
             "temperature": 0,
-            "max_tokens": 2000,
+            "max_tokens": max_tokens,
             "messages": [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": PROMPT},
+                        {"type": "text", "text": prompt},
                         {"type": "image_url", "image_url": {"url": image_to_data_url(image)}},
                     ],
                 }
@@ -158,8 +279,23 @@ class VisionReader:
                 )
                 if res.status_code >= 400:
                     raise RuntimeError(f"vision {res.status_code}: {res.text[:200]}")
-                content = res.json()["choices"][0]["message"]["content"]
-                return parse_chat_read(parse_json_object(content), image.size)
-            except (requests.RequestException, RuntimeError, KeyError) as exc:
+                return parse_json_object(res.json()["choices"][0]["message"]["content"])
+            except (requests.RequestException, RuntimeError, KeyError, IndexError) as exc:
                 last_error = exc
         raise RuntimeError(f"视觉模型调用失败: {last_error}")
+
+    def read_chat(self, image: Image.Image) -> ChatRead:
+        """Read title and messages from the chat pane (title bar down to the input box)."""
+        read = parse_chat_read(self._ask(PROMPT, image, 2000), image.size)
+        fix_sides(read, image)
+        return read
+
+    def read_title(self, image: Image.Image) -> tuple[str, int | None]:
+        data = self._ask(TITLE_PROMPT, image, 100)
+        return _split_title(data.get("title"), data.get("member_count"))
+
+    def session_rows(self, image: Image.Image) -> list[Row]:
+        return parse_rows(self._ask(SESSIONS_PROMPT, image, 800), image.size)
+
+    def search_rows(self, image: Image.Image) -> list[Row]:
+        return parse_rows(self._ask(SEARCH_PROMPT, image, 800), image.size)

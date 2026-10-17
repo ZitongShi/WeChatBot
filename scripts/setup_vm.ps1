@@ -1,4 +1,4 @@
-# One-time setup inside the VM. Run in an elevated PowerShell:
+﻿# One-time setup inside the VM. Run in an elevated PowerShell:
 #   powershell -ExecutionPolicy Bypass -File scripts\setup_vm.ps1
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent

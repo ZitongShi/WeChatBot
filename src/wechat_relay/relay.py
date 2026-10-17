@@ -14,7 +14,7 @@ from wechat_customer_bot.log import JsonlLogger
 from . import ui
 from .config import RelayConfig
 from .layout import Layout, detect_layout, find_unread_rows
-from .screen import capture_window, find_main_window, place_window
+from .screen import capture_window, find_main_window, place_window, window_rect
 from .store import RelayState
 from .vision import ChatMessage, ChatRead, VisionReader
 
@@ -30,6 +30,8 @@ TYPE_LABELS = {
 }
 
 REPLY_ID = re.compile(r"#\s*(\d{1,6})")
+# Our own forward header ("#12【群】…") showing up as message text means it is a quote.
+FORWARD_QUOTE = re.compile(r"#\s*\d{1,6}\s*【[私群]】")
 HELP_TEXT = "\n".join(
     [
         "【转发助手】用法：",
@@ -90,6 +92,24 @@ def parse_command(message: ChatMessage) -> Command:
     return Command("unknown", text=text)
 
 
+def attach_split_quotes(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Fold a quoted forward the vision model listed as its own message back into the reply."""
+    merged: list[ChatMessage] = []
+    for message in messages:
+        prev = merged[-1] if merged else None
+        if (
+            prev is not None
+            and FORWARD_QUOTE.search(message.text)
+            and not prev.quote
+            and prev.side == message.side
+            and prev.type == "text"
+        ):
+            prev.quote = message.text
+            continue
+        merged.append(message)
+    return merged
+
+
 def image_hash(image: Image.Image) -> str:
     return hashlib.sha1(image.convert("RGB").tobytes()).hexdigest()
 
@@ -102,6 +122,8 @@ class Relay:
         self.vision = VisionReader(config.llm_base_url, config.llm_api_key, config.vision_model)
         self.hwnd = find_main_window()
         self.layout: Layout | None = None
+        if config.save_debug_screens:
+            ui.DEBUG_HOOK = self.debug_step
         # Chats the bot typed into. Messages that arrive while a chat is open never get an
         # unread badge, so each one is re-checked when idle: chat name -> messages-area hash.
         self.revisit: dict[str, str] = {}
@@ -132,28 +154,49 @@ class Relay:
         assert self.layout is not None
         return image.crop(self.layout.messages_box)
 
+    def debug_step(self, step: str, details: dict) -> None:
+        """Log a navigation step and save what the screen looks like at that moment."""
+        stamp = datetime.now().strftime("%H%M%S-%f")[:-3]
+        self.logger.write("ui_step", step=step, shot=f"{stamp}-{step}.png", **details)
+        capture_window(self.hwnd).save(self.config.debug_dir / f"{stamp}-{step}.png")
+
     def save_debug(self, image: Image.Image, name: str) -> None:
         if self.config.save_debug_screens:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             image.save(self.config.debug_dir / f"{stamp}-{name}.png")
 
-    def read_current_chat(self) -> tuple[str, ChatRead]:
-        crop = self.messages_crop()
+    def read_current_chat(self) -> ChatRead:
+        """Title and messages of the open chat, from one vision call."""
+        image = self.capture()
         assert self.layout is not None
-        title = ui.read_header(self.hwnd, self.layout)
+        crop = image.crop(self.layout.chat_box)
         self.save_debug(crop, "chat")
-        return title, self.vision.read_chat(crop)
+        read = self.vision.read_chat(crop)
+        read.messages = attach_split_quotes(read.messages)
+        return read
 
     def messages_point(self, message: ChatMessage) -> tuple[int, int] | None:
         if not message.box or self.layout is None:
             return None
         x1, y1, x2, y2 = message.box
-        left, top, _, _ = self.layout.messages_box
+        left, top, _, _ = self.layout.chat_box
         return left + (x1 + x2) // 2, top + (y1 + y2) // 2
 
     def open_chat(self, name: str) -> str:
+        # Re-capture first so a resized window never leaves us clicking stale coordinates.
+        self.capture()
         assert self.layout is not None
-        return ui.open_chat(self.hwnd, self.layout, name)
+        self.log("open_chat", name=name)
+        try:
+            return ui.open_chat(self.hwnd, self.layout, self.vision, name)
+        except ui.UiError:
+            # Keep the scene of every failed navigation for debugging.
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            try:
+                capture_window(self.hwnd).save(self.config.debug_dir / f"{stamp}-open-failed.png")
+            except Exception:
+                pass
+            raise
 
     def send_text(self, chat: str, text: str) -> None:
         assert self.layout is not None
@@ -177,9 +220,13 @@ class Relay:
     def run(self) -> None:
         place_window(self.hwnd, self.config.window_rect)
         ui.activate(self.hwnd)
-        time.sleep(0.8)
+        self.wait_for_window_size()
         self.capture()
-        self.bootstrap_main_chat()
+        try:
+            self.bootstrap_main_chat()
+        except Exception as exc:
+            self.log("bootstrap_failed", error=str(exc), trace=traceback.format_exc()[-800:])
+            raise
         self.park()
         self.log("started", forward_to=self.config.forward_to, park=self.config.park_chat)
         while True:
@@ -199,10 +246,27 @@ class Relay:
                     pass
             time.sleep(self.config.poll_interval_sec)
 
+    def wait_for_window_size(self, timeout: float = 8.0) -> None:
+        """WeChat applies a resize asynchronously; wait until the rect matches and settles."""
+        want = self.config.window_rect
+        if want is None:
+            time.sleep(1.0)  # maximize is applied asynchronously too
+            return
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            left, top, right, bottom = window_rect(self.hwnd)
+            current = (left, top, right - left, bottom - top)
+            if current == last and abs(current[2] - want[2]) <= 8 and abs(current[3] - want[3]) <= 8:
+                return
+            last = current
+            time.sleep(0.5)
+        self.log("window_size_mismatch", want=list(want), got=list(last or ()))
+
     def bootstrap_main_chat(self) -> None:
         """Remember what is already in the main chat so old messages are not run as commands."""
         chat = ui.strip_member_count(self.open_chat(self.config.forward_to))
-        _, read = self.read_current_chat()
+        read = self.read_current_chat()
         self.state.take_new(chat, read.messages)
         self.state.save()
         self.log("bootstrap", chat=chat, visible=len(read.messages))
@@ -230,15 +294,15 @@ class Relay:
             self.park()
 
     def handle_open_chat(self) -> None:
-        title, read = self.read_current_chat()
-        chat = ui.strip_member_count(title) or "未知会话"
-        is_group = ui.is_group_title(title)
+        read = self.read_current_chat()
+        chat = read.title or "未知会话"
+        is_group = read.is_group
         if not read.messages:
             self.log("empty_read", chat=chat)
             return
 
         if self.config.transcribe_voice and self.transcribe_voices(chat, read):
-            title, read = self.read_current_chat()
+            read = self.read_current_chat()
 
         new, complete = self.state.take_new(chat, read.messages)
         self.state.save()
@@ -301,6 +365,10 @@ class Relay:
     def handle_command(self, main_chat: str, message: ChatMessage) -> None:
         if message.type != "text":
             return
+        if FORWARD_QUOTE.search(message.text):
+            # A quoted forward that the vision model split out of the replying bubble.
+            self.log("command_skipped_quote", text=message.text[:60])
+            return
         command = parse_command(message)
         self.log("command", kind=command.kind, target=command.target_id, text=command.text[:80])
         if command.kind == "help":
@@ -322,7 +390,7 @@ class Relay:
         try:
             self.open_chat(target)
             self.send_text(target, command.text)
-            _, read = self.read_current_chat()
+            read = self.read_current_chat()
             ok = any(m.side == "R" and ui.names_match(command.text, m.text) for m in read.messages[-3:])
             ack = (
                 f"✓ 已回复 #{command.target_id} {target}"

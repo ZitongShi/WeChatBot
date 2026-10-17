@@ -1,4 +1,4 @@
-# Start the WeChat relay (secondary account -> main account).
+﻿# Start the WeChat relay (secondary account -> main account).
 #   .\start_relay.ps1          run, restarting automatically if it crashes
 #   .\start_relay.ps1 -Check   only save an annotated screenshot of the detected layout
 param([switch]$Check)

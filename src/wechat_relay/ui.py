@@ -9,13 +9,25 @@ import win32con
 import win32gui
 import win32process
 
-from .layout import Layout
-from .screen import OcrLine, capture_screen, capture_window, ocr_lines, ocr_text, window_rect
-from .vision import normalize_for_match
+from .layout import SELECTED_ROW, Layout, close_color, find_list_rows, snap_to_row
+from .screen import OcrLine, capture_screen, capture_window, ocr_lines, window_rect
+from .vision import Row, VisionReader, normalize_for_match
 
 
 class UiError(RuntimeError):
     pass
+
+# Set by the relay when debug screens are on: called as DEBUG_HOOK(step, details) at each
+# navigation step so failures can be replayed from screenshots instead of guessed.
+DEBUG_HOOK = None
+
+
+def _debug(step: str, **details) -> None:
+    if DEBUG_HOOK is not None:
+        try:
+            DEBUG_HOOK(step, details)
+        except Exception:
+            pass
 
 
 def activate(hwnd: int) -> None:
@@ -31,7 +43,8 @@ def activate(hwnd: int) -> None:
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
         pass
-    time.sleep(0.25)
+    # The first click right after activation is otherwise swallowed by the activation.
+    time.sleep(0.6)
     if win32gui.GetForegroundWindow() != hwnd:
         raise UiError("无法把微信窗口切到前台")
 
@@ -77,10 +90,23 @@ def to_screen(hwnd: int, point: tuple[int, int]) -> tuple[int, int]:
     return left + point[0], top + point[1]
 
 
-def click(hwnd: int, point: tuple[int, int], right: bool = False) -> None:
-    ensure_foreground(hwnd)
-    x, y = to_screen(hwnd, point)
-    win32api.SetCursorPos((x, y))
+def _place_cursor(x: int, y: int) -> None:
+    """Move the cursor and make sure it stays there.
+
+    In a VM with mouse integration the host pointer keeps overwriting the guest cursor, so a
+    click could land wherever the person's real mouse is. Refuse to click in that case.
+    """
+    for _ in range(3):
+        win32api.SetCursorPos((x, y))
+        time.sleep(0.05)
+        cx, cy = win32api.GetCursorPos()
+        if abs(cx - x) <= 2 and abs(cy - y) <= 2:
+            return
+        time.sleep(0.2)
+    raise UiError("鼠标位置被外部改动（虚拟机的鼠标集成？），已放弃点击")
+
+
+def _press_button(right: bool = False) -> None:
     down, up = (
         (win32con.MOUSEEVENTF_RIGHTDOWN, win32con.MOUSEEVENTF_RIGHTUP)
         if right
@@ -91,11 +117,15 @@ def click(hwnd: int, point: tuple[int, int], right: bool = False) -> None:
     win32api.mouse_event(up, 0, 0, 0, 0)
 
 
+def click(hwnd: int, point: tuple[int, int], right: bool = False) -> None:
+    ensure_foreground(hwnd)
+    _place_cursor(*to_screen(hwnd, point))
+    _press_button(right)
+
+
 def click_screen(x: int, y: int) -> None:
-    win32api.SetCursorPos((x, y))
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-    time.sleep(0.03)
-    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+    _place_cursor(x, y)
+    _press_button()
 
 
 def press(*keys: int) -> None:
@@ -167,85 +197,170 @@ def names_match(expected: str, actual: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.7
 
 
-def read_header(hwnd: int, layout: Layout) -> str:
-    import re
+def same_name(expected: str, shown: str) -> bool:
+    """Strict match for names read by the vision model; a cut-off name ("ab...") matches its prefix."""
+    a = normalize_for_match(expected)
+    b = normalize_for_match(shown)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    stripped = shown.strip().rstrip(".…").strip()
+    prefix = normalize_for_match(stripped)
+    return stripped != shown.strip() and len(prefix) >= 2 and a.startswith(prefix)
 
-    title = ocr_text(capture_window(hwnd).crop(layout.header_box))
-    # OCR sometimes adds stray brackets/punctuation before the title.
-    return re.sub(r"^[^\w\[【(（]+", "", title).strip()
+
+SEARCH_ALLOWED = ("联系人", "群聊", "功能", "最常使用")
 
 
-SEARCH_HEADERS = ("联系人", "群聊", "功能", "最常使用", "聊天记录", "聊天文件", "搜索网络结果", "更多", "查看全部")
-SEARCH_ALLOWED = {"联系人", "群聊", "功能", "最常使用"}
-
-
-def pick_search_result(lines: list[OcrLine], name: str) -> OcrLine | None:
-    """Pick the contact/group result whose title is the name (never a chat-history hit)."""
-    titles: list[OcrLine] = []
-    section = "联系人"  # results start with contacts when the header is not recognised
-    for line in sorted(lines, key=lambda l: l.y):
-        text = line.text.replace(" ", "")
-        header = next((h for h in SEARCH_HEADERS if text.startswith(h) and len(text) <= len(h) + 4), None)
-        if header:
-            section = header
+def pick_row(rows: list[Row], name: str, sections: tuple[str, ...] | None = None) -> Row | None:
+    """The first row titled `name`; with `sections`, only rows under one of those headers."""
+    for row in rows:
+        if sections is not None and not any(row.section.startswith(h) for h in sections):
             continue
-        if section in SEARCH_ALLOWED and 80 <= line.x <= 200 and ":" not in text and "：" not in text:
-            titles.append(line)
-    target = normalize_for_match(name)
-    for line in titles:
-        if normalize_for_match(line.text) == target:
-            return line
-    # Windows OCR garbles some glyphs (件 -> 亻牛), so fall back to close matches.
-    scored = [
-        (difflib.SequenceMatcher(None, target, normalize_for_match(l.text)).ratio(), l) for l in titles
-    ]
-    best = max(scored, key=lambda item: item[0], default=None)
-    if best and best[0] >= 0.75:
-        return best[1]
-    for line in titles:
-        text = line.text.rstrip(".…")
-        if line.text != text and len(normalize_for_match(text)) >= 2 and target.startswith(normalize_for_match(text)):
-            return line
+        if same_name(name, row.name):
+            return row
     return None
 
 
-def open_chat(hwnd: int, layout: Layout, name: str) -> str:
+def read_title(hwnd: int, layout: Layout, reader: VisionReader) -> tuple[str, int | None]:
+    return reader.read_title(capture_window(hwnd).crop(layout.header_box))
+
+
+def _verify_title(hwnd: int, layout: Layout, reader: VisionReader, name: str, how: str) -> str:
+    title, count = read_title(hwnd, layout, reader)
+    _debug("title_check", name=name, title=title, count=count)
+    if not same_name(name, title):
+        raise UiError(f"{how}失败：想打开 {name!r}，实际标题 {title!r}")
+    return f"{title}({count})" if count else title
+
+
+def _input_region(layout: Layout) -> tuple[int, int, int, int]:
+    return (layout.chat_left + 20, layout.input_top + 8, layout.chat_right - 20, layout.height - 70)
+
+
+def _changed_pixels(a, b) -> int:
+    from PIL import ImageChops
+
+    diff = ImageChops.difference(a.convert("L"), b.convert("L")).point(lambda v: 255 if v > 40 else 0)
+    return sum(1 for v in diff.getdata() if v)
+
+
+def _search_popup(hwnd: int, layout: Layout, before: set[int]) -> tuple[int, tuple[int, int, int, int]] | None:
+    """The search-result popup: a new WeChat window just below the search box, over the session list."""
+    left, top, _, _ = window_rect(hwnd)
+    sx, sy = left + layout.search_point[0], top + layout.search_point[1]
+    for other in wechat_windows(hwnd):
+        if other in before:
+            continue
+        box = win32gui.GetWindowRect(other)
+        width, height = box[2] - box[0], box[3] - box[1]
+        if height >= 150 and width >= 150 and box[0] <= sx <= box[2] and sy - 80 <= box[1] <= sy + 120:
+            return other, box
+    return None
+
+
+def _row_selected(hwnd: int, layout: Layout, y: int) -> bool:
+    """The clicked session-list row turns green once its chat is open."""
+    image = capture_window(hwnd).convert("RGB")
+    x = layout.list_left + 8
+    return any(close_color(image.getpixel((x, yy)), SELECTED_ROW, 12) for yy in (y - 10, y, y + 10))
+
+
+def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str | None:
+    """Click the chat's row in the visible session list; None when it is not visible."""
+    image = capture_window(hwnd)
+    box = (layout.list_left, layout.header_bottom, layout.list_right, layout.height - 10)
+    rows = reader.session_rows(image.crop(box))
+    row = pick_row(rows, name)
+    avatars = find_list_rows(image, layout)
+    y = None
+    if row is not None:
+        top = layout.header_bottom
+        y = snap_to_row(top + row.center[1], avatars, rows.index(row), top + rows[0].center[1])
+    _debug("list_rows", name=name, rows=[(r.name, *r.center) for r in rows], row=row and row.name, avatars=avatars, y=y)
+    if y is None:
+        return None
+    point = ((layout.list_left + layout.list_right) // 2, y)
+    _debug("list_click", point=point, screen=to_screen(hwnd, point))
+    click(hwnd, point)
+    time.sleep(1.0)
+    _debug("after_list_click")
+    if not _row_selected(hwnd, layout, point[1]) and not close_chat_popouts(hwnd):
+        # The click did nothing (e.g. swallowed by window activation): try the same row once more.
+        click(hwnd, point)
+        time.sleep(1.0)
+        _debug("after_list_click_retry")
+    if close_chat_popouts(hwnd):
+        raise UiError(f"{name!r} 被弹出成独立窗口，已关闭")
+    return _verify_title(hwnd, layout, reader, name, "点击会话列表")
+
+
+def open_chat(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str:
+    """Open a chat: click its row in the session list, else fall back to searching.
+
+    Returns the header title ("群名(32)" for groups); raises unless it is exactly the name.
+    """
+    close_chat_popouts(hwnd)
+    ensure_foreground(hwnd)
+    title = open_chat_from_list(hwnd, layout, reader, name)
+    if title is not None:
+        return title
+    return open_chat_by_search(hwnd, layout, reader, name)
+
+
+def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str:
     """Open a chat via the search box; returns the header title, raises if it does not match.
 
-    Nothing is typed unless the search popup is confirmed open, and the result is clicked
-    by its exact title, so a failure can never paste the name into the current chat.
+    Guards against typing into the current chat: the result popup must sit right under the
+    search box, the chat input is compared before and after pasting (and cleared if the
+    paste landed there), and the clicked result must be inside the popup. Never presses Enter.
     """
     close_chat_popouts(hwnd)
     ensure_foreground(hwnd)
     if wechat_windows(hwnd):
         dismiss_popups(hwnd, layout)
+    region = _input_region(layout)
+    input_before = capture_window(hwnd).crop(region)
     before = set(wechat_windows(hwnd))
+    _debug("search_click", point=layout.search_point, screen=to_screen(hwnd, layout.search_point))
     click(hwnd, layout.search_point)
     time.sleep(0.6)
-    if not [w for w in wechat_windows(hwnd) if w not in before]:
-        raise UiError("搜索框没有打开")
+    _debug("after_search_click")
     set_clipboard_text(name)
     press(win32con.VK_CONTROL, ord("A"))
     press(win32con.VK_CONTROL, ord("V"))
     time.sleep(1.5)
-    popups = [w for w in wechat_windows(hwnd) if w not in before]
-    if not popups:
-        raise UiError("搜索结果没有出现")
-    box = win32gui.GetWindowRect(popups[0])
-    result = pick_search_result(ocr_lines(capture_screen(box)), name)
+    if _changed_pixels(input_before, capture_window(hwnd).crop(region)) > 200:
+        # The paste went into the chat input box: wipe it before anything can send it.
+        click(hwnd, layout.input_point)
+        press(win32con.VK_CONTROL, ord("A"))
+        press(win32con.VK_DELETE)
+        raise UiError(f"搜索 {name!r} 时文字落进了聊天输入框，已清空并中止")
+    popup = _search_popup(hwnd, layout, before)
+    if popup is None:
+        dismiss_popups(hwnd, layout)
+        raise UiError("没有找到搜索结果弹窗")
+    _, box = popup
+    rows = reader.search_rows(capture_screen(box))
+    # Only contacts / groups: a 聊天记录 hit opens a separate window, 搜索网络结果 a web page.
+    result = pick_row(rows, name, SEARCH_ALLOWED)
+    _debug("search_rows", box=box, rows=[(r.section, r.name, *r.center) for r in rows], result=result and result.name)
     if result is None:
         dismiss_popups(hwnd, layout)
         raise UiError(f"搜索结果里没有找到 {name!r}")
     cx, cy = result.center
+    if not (0 <= cx <= box[2] - box[0] and 0 <= cy <= box[3] - box[1]):
+        dismiss_popups(hwnd, layout)
+        raise UiError("搜索结果位置异常")
+    _debug("result_click", screen=(box[0] + cx, box[1] + cy))
     click_screen(box[0] + cx, box[1] + cy)
     time.sleep(1.2)
+    _debug("after_result_click", popouts=list(wechat_windows(hwnd).values()))
     if close_chat_popouts(hwnd):
         raise UiError(f"{name!r} 被弹出成独立窗口，已关闭")
     ensure_foreground(hwnd)
-    title = read_header(hwnd, layout)
-    if not names_match(name, strip_member_count(title)):
-        raise UiError(f"打开会话失败：想打开 {name!r}，实际标题 {title!r}")
-    return title
+    return _verify_title(hwnd, layout, reader, name, "打开会话")
 
 
 def strip_member_count(title: str) -> str:
@@ -253,12 +368,6 @@ def strip_member_count(title: str) -> str:
     import re
 
     return re.sub(r"[(（]\s*\d+\s*[)）]\s*$", "", title).strip()
-
-
-def is_group_title(title: str) -> bool:
-    import re
-
-    return bool(re.search(r"[(（]\s*\d+\s*[)）]\s*$", title))
 
 
 def send_text(hwnd: int, layout: Layout, text: str) -> None:

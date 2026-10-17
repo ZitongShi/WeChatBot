@@ -50,8 +50,13 @@ replies back to the right sender.
 How it works:
 
 - Unread red badges in the session list are detected locally from pixels (no model call).
-- The bot opens the chat, reads the header title with Windows OCR, and reads the messages
-  with a vision model (`qwen3-vl:32b` on soclaas, ~7s per read).
+- The bot opens the chat and reads the title bar and the messages in one vision-model call
+  (`qwen3.6:35b` on soclaas, ~1-4s). Left/right is then decided from pixels (green bubble,
+  avatar side), not by the model.
+- To open a chat by name, the vision model lists the session-list rows (or the search
+  results) and the click is snapped to the avatar found locally at that position; the
+  chat's title is then read back by the vision model and must match exactly before
+  anything is typed. Windows OCR is only used for right-click menu items.
 - New messages are found by anchoring on the last messages seen in that chat.
 - It forwards them as one message per chat, then parks on `文件传输助手` so that every new
   message elsewhere shows up as a badge.

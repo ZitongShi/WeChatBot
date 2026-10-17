@@ -4,10 +4,21 @@ bot 需要独占鼠标、键盘和屏幕，所以把小号微信和 bot 一起�
 
 ## 1. 虚拟机软件
 
-宿主机是 Windows 11 家庭版，没有 Hyper-V，用 **VMware Workstation Pro**（个人免费）：
+宿主机是 Windows 11 家庭版，没有 Hyper-V。当前用的是 **VirtualBox 7.2**（官网直接下载，无需账号）：
 
-- 从 Broadcom 官方支持门户下载（需要注册 Broadcom 账号）。不要用来路不明的网盘破解包。
-- 备选：VirtualBox（免费、开源），步骤基本一样。
+```powershell
+# 建虚拟机（EFI + 安全启动 + TPM 2.0，显卡用 VMSVGA，关闭剪贴板/拖放共享）
+powershell -ExecutionPolicy Bypass -File scripts\vbox_create_vm.ps1
+# 无人值守安装 Windows 11 专业版（自己运行，会提示输入虚拟机用户名和密码）
+powershell -ExecutionPolicy Bypass -File scripts\vbox_install_windows.ps1
+```
+
+注意：
+
+- 宿主机开着 VBS（基于虚拟化的安全），VirtualBox 会跑在 Hyper-V 之上，稍慢但够用。
+- **显卡必须用 VMSVGA**。用 VBoxSVGA 时，Windows 安装重启后一直黑屏（安装其实在继续）。
+- 安装完成后删除 `E:\VMs\WeChatRelay\Unattended-*` 文件：里面有明文密码。
+- 也可以用 VMware Workstation Pro（需要 Broadcom 账号下载），下面第 2 节的设置同样适用。
 
 ## 2. 虚拟机配置
 

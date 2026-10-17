@@ -22,7 +22,7 @@ class RelayConfig:
     max_images_per_batch: int
     transcribe_voice: bool
     ignore_chats: list[str] = field(default_factory=list)
-    window_rect: tuple[int, int, int, int] = (0, 0, 1400, 1040)
+    window_rect: tuple[int, int, int, int] | None = None
     state_file: Path = ROOT / "data" / "relay" / "state.json"
     log_file: Path = ROOT / "logs" / "relay.jsonl"
     debug_dir: Path = ROOT / "data" / "relay" / "debug"
@@ -79,12 +79,13 @@ def load_relay_config(path: str | None = None) -> RelayConfig:
         poll_interval_sec=float(raw.get("poll_interval_sec", 1.0)),
         llm_base_url=(env.get("SOCLAAS_BASE_URL") or str(raw.get("llm_base_url") or "")).rstrip("/"),
         llm_api_key=env.get("SOCLAAS_API_KEY") or "",
-        vision_model=str(raw.get("vision_model") or "qwen3-vl:32b"),
+        vision_model=str(raw.get("vision_model") or "qwen3.6:35b"),
         forward_images=bool(raw.get("forward_images", True)),
         max_images_per_batch=int(raw.get("max_images_per_batch", 3)),
         transcribe_voice=bool(raw.get("transcribe_voice", True)),
         ignore_chats=[str(v) for v in raw.get("ignore_chats", [])],
-        window_rect=tuple(int(v) for v in raw.get("window_rect", [0, 0, 1400, 1040])),
+        # null (the default) maximizes the WeChat window; [left, top, width, height] pins it.
+        window_rect=tuple(int(v) for v in raw["window_rect"]) if raw.get("window_rect") else None,
         state_file=state_file,
         log_file=log_file,
         debug_dir=debug_dir,
