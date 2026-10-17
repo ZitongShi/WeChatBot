@@ -72,7 +72,11 @@ Forward format:
 ```
 
 Reply from the main account by **quoting** a forwarded message and typing, or with
-`#12 内容`. `/list` shows recent chats, `/help` shows usage.
+`#12 内容`. `/截图 #12` (or `/截图 会话名`, or `/截图` while quoting a forward) sends a
+screenshot of that chat as it looks right now. `/list` shows recent chats, `/help` shows usage.
+
+Whenever the bot opens a chat (to reply, to take a screenshot, or by mistake) it reads it
+and relays anything new, because opening a chat clears its unread badge.
 
 Setup:
 

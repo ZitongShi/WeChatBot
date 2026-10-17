@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import time
 from dataclasses import dataclass, field
@@ -68,17 +69,39 @@ class RelayState:
         return new, found
 
 
+def _same_sig(a: str, b: str) -> bool:
+    """Signatures match; the text part may differ by a misread glyph between two vision reads."""
+    if a == b:
+        return True
+    a_head, _, a_text = a.rpartition("|")
+    b_head, _, b_text = b.rpartition("|")
+    if a_head != b_head or min(len(a_text), len(b_text)) < 4:
+        return False
+    return difflib.SequenceMatcher(None, a_text, b_text).ratio() >= 0.8
+
+
+def _distinctive(sig: str) -> bool:
+    """Long enough to anchor on by itself ("ok" or "好" could be any message)."""
+    return len(sig.rpartition("|")[2]) >= 4
+
+
 def split_after_anchor(
     messages: list[ChatMessage], sigs: list[str], anchor: list[str]
 ) -> tuple[list[ChatMessage], bool]:
     if anchor:
         # Longest suffix of the anchor that appears contiguously in the current view.
-        min_len = 1 if len(anchor) == 1 else 2
+        # A single message is enough when its text is distinctive and it appears only once,
+        # e.g. after the rest of the anchor scrolled out of view.
+        min_len = 1 if len(anchor) == 1 or _distinctive(anchor[-1]) else 2
         for size in range(len(anchor), min_len - 1, -1):
             tail = anchor[-size:]
-            for end in range(len(sigs), size - 1, -1):
-                if sigs[end - size : end] == tail:
-                    return messages[end:], True
+            ends = [
+                end
+                for end in range(len(sigs), size - 1, -1)
+                if all(_same_sig(x, y) for x, y in zip(sigs[end - size : end], tail))
+            ]
+            if ends and (size > 1 or len(anchor) == 1 or len(ends) == 1):
+                return messages[ends[0] :], True
     # No usable anchor: treat everything after my own last message as unread.
     last_self = max((i for i, m in enumerate(messages) if m.side == "R"), default=-1)
     return messages[last_self + 1 :][-10:], False

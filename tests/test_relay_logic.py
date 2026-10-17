@@ -10,7 +10,7 @@ from wechat_relay.layout import (
     find_unread_rows,
     snap_to_row,
 )
-from wechat_relay.relay import format_forward, parse_command
+from wechat_relay.relay import Command, format_forward, parse_command
 from wechat_relay.store import RelayState, split_after_anchor
 from wechat_relay.ui import names_match, pick_row, same_name, strip_member_count
 from wechat_relay.vision import (
@@ -50,6 +50,28 @@ def test_repeated_text_is_still_new():
     assert [m.text for m in new] == ["好"]
 
 
+def test_single_distinctive_anchor_after_scrolling():
+    # Only the last forwarded message is still visible; my reply came after the new ones.
+    old = [msg("ok"), msg("爸爸"), msg("哈哈", side="R"), msg("其实你才是对的")]
+    now = [msg("其实你才是对的"), msg("我是大神"), msg("你是什么"), msg("你叫什么名字"), msg("我在", side="R"), msg("好的呀")]
+    new, found = split_after_anchor(now, [m.signature for m in now], [m.signature for m in old])
+    assert found and [m.text for m in new if m.side == "L"] == ["我是大神", "你是什么", "你叫什么名字", "好的呀"]
+
+
+def test_anchor_tolerates_a_misread_glyph():
+    old = [msg("ok"), msg("王总今天来吗"), msg("爸爸")]
+    now = [msg("ok"), msg("王总今天来么"), msg("爸爸"), msg("在吗")]
+    new, found = split_after_anchor(now, [m.signature for m in now], [m.signature for m in old])
+    assert found and [m.text for m in new] == ["在吗"]
+
+
+def test_short_single_anchor_is_not_trusted():
+    old = [msg("a"), msg("ok")]
+    now = [msg("ok"), msg("x"), msg("ok"), msg("y")]
+    _, found = split_after_anchor(now, [m.signature for m in now], [m.signature for m in old])
+    assert not found
+
+
 def test_no_anchor_takes_messages_after_my_last_reply():
     now = [msg("old"), msg("mine", side="R"), msg("x"), msg("y")]
     new, found = split_after_anchor(now, [m.signature for m in now], [])
@@ -74,6 +96,16 @@ def test_parse_command_variants():
     assert (quoted.kind, quoted.target_id, quoted.text) == ("reply", 7, "收到")
     assert parse_command(msg("/list")).kind == "list"
     assert parse_command(msg("随便说说")).kind == "unknown"
+
+
+def test_parse_screenshot_command():
+    assert parse_command(msg("/截图 #12")) == Command("shot", 12)
+    assert parse_command(msg("/截图 专业班子")) == Command("shot", text="专业班子")
+    assert parse_command(msg("/shot")) == Command("shot")
+    assert parse_command(msg("/截图", quote="#7【私】李雷 在吗")) == Command("shot", 7)
+    # Without the slash it is ordinary text to send.
+    assert parse_command(msg("#3 截图")) == Command("reply", 3, "截图")
+    assert parse_command(msg("截图", quote="#7【私】李雷")) == Command("reply", 7, "截图")
 
 
 def test_format_forward_group_and_private():
@@ -215,3 +247,120 @@ def test_split_out_quote_is_recognised():
     assert FORWARD_QUOTE.search("BQ7: #1【私】李雷 ok （可能还有更早的消息未显示）")
     assert FORWARD_QUOTE.search("#12【群】专业班子 张三：开会")
     assert not FORWARD_QUOTE.search("#1 好的收到")
+
+
+class FakeRelay:
+    """Relay with the UI stubbed out: `sent` records (open chat, text) for everything typed."""
+
+    def __init__(self, tmp_path, monkeypatch, reads):
+        from collections import deque
+
+        from wechat_relay import ui
+        from wechat_relay.relay import Relay
+
+        self.relay = r = Relay.__new__(Relay)
+        r.state = RelayState(path=tmp_path / "s.json")
+        r.revisit = {}
+        r.commands = deque()
+        r.current = None
+        r.read_hash = ""
+        r.layout = object()
+        r.hwnd = 0
+        r.config = type("C", (), {"forward_to": "zitong", "forward_to_title": "zitong", "ignore_chats": [], "park_chat": "文件传输助手"})()
+        self.sent = []
+        self.forwards = []
+        self.reads = list(reads)
+        r.log = lambda event, **data: None
+        r.park = lambda: setattr(r, "current", "文件传输助手")
+        r.open_chat = lambda name: setattr(r, "current", name) or name
+        r.forward = lambda chat, is_group, messages, complete: self.forwards.append((chat, [m.text for m in messages]))
+
+        def read():
+            current = self.reads.pop(0)
+            r.read_hash = f"hash{len(self.reads)}"
+            return current
+
+        r.read_current_chat = read
+        monkeypatch.setattr(ui, "send_text", lambda hwnd, layout, text: self.sent.append((r.current, text)))
+        monkeypatch.setattr(ui, "send_image", lambda hwnd, layout, image: self.sent.append((r.current, "<image>")))
+
+
+def chat_read(title, *messages):
+    from wechat_relay.vision import ChatRead
+
+    return ChatRead(False, list(messages), title=title)
+
+
+def test_reply_relays_messages_that_arrived_in_the_target(tmp_path, monkeypatch):
+    fake = FakeRelay(
+        tmp_path,
+        monkeypatch,
+        [
+            # The target, read right after the reply: three messages came in since #1.
+            chat_read("李雷", msg("其实你才是对的"), msg("我是大神"), msg("你是什么"), msg("你叫什么名字"), msg("好的", side="R")),
+            # The main chat after the acknowledgement.
+            chat_read("zitong", msg("#1 好的"), msg("✓ 已回复 #1 李雷", side="R")),
+        ],
+    )
+    relay = fake.relay
+    relay.state.take_new("李雷", [msg("在吗"), msg("其实你才是对的")])
+    relay.state.take_new("zitong", [msg("#1 好的")])
+    fid = relay.state.new_forward("李雷", False)
+    relay.handle_command("zitong", msg(f"#{fid} 好的"))
+    assert fake.sent[0] == ("李雷", "好的")
+    assert fake.forwards == [("李雷", ["我是大神", "你是什么", "你叫什么名字"])]
+    assert fake.sent[-1][0] == "zitong" and fake.sent[-1][1].startswith("✓ 已回复")
+    # Both chats the bot typed into are re-checked against the image of the read after typing.
+    assert set(relay.revisit) == {"李雷", "zitong"}
+
+
+def test_command_arriving_while_another_runs_is_queued(tmp_path, monkeypatch):
+    fake = FakeRelay(
+        tmp_path,
+        monkeypatch,
+        [
+            chat_read("zitong", msg("old"), msg("/help")),
+            # Read right after answering /help: /list arrived before the answer went out.
+            chat_read("zitong", msg("old"), msg("/help"), msg("/list"), msg("【转发助手】用法：", side="R")),
+            chat_read("zitong", msg("/list"), msg("【转发助手】用法：", side="R"), msg("暂无转发记录", side="R")),
+        ],
+    )
+    relay = fake.relay
+    relay.state.take_new("zitong", [msg("old")])
+    relay.process_read(relay.read_current_chat())
+    assert [m.text for _, m in relay.commands] == ["/help"]
+    relay.tick()
+    assert [m.text for _, m in relay.commands] == ["/list"]
+    assert relay.current == "zitong"  # stays in the main chat while commands are queued
+    relay.tick()
+    assert not relay.commands and relay.current == "文件传输助手"
+    assert [text.splitlines()[0] for _, text in fake.sent] == ["【转发助手】用法：", "暂无转发记录"]
+
+
+def test_wrong_chat_is_queued_for_reading(tmp_path):
+    from wechat_relay import ui
+    from wechat_relay.relay import Relay
+
+    relay = Relay.__new__(Relay)
+    relay.revisit = {}
+    relay.layout = object()
+    relay.hwnd = 0
+    relay.vision = None
+    relay.current = None
+    relay.config = type("C", (), {"debug_dir": tmp_path})()
+    relay.log = lambda event, **data: None
+    relay.capture = lambda: None
+
+    def wrong(*args):
+        raise ui.WrongChat("x", "李雷")
+
+    original = ui.open_chat
+    ui.open_chat = wrong
+    try:
+        try:
+            relay.open_chat("zitong")
+        except ui.WrongChat:
+            pass
+    finally:
+        ui.open_chat = original
+    assert relay.revisit == {"李雷": ""} and relay.current == "李雷"

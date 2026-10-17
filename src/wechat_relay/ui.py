@@ -17,6 +17,15 @@ from .vision import Row, VisionReader, normalize_for_match
 class UiError(RuntimeError):
     pass
 
+
+class WrongChat(UiError):
+    """A different chat than wanted got opened. Opening it cleared its unread badge, so the
+    caller must read it now or its new messages are never seen."""
+
+    def __init__(self, message: str, title: str):
+        super().__init__(message)
+        self.title = title
+
 # Set by the relay when debug screens are on: called as DEBUG_HOOK(step, details) at each
 # navigation step so failures can be replayed from screenshots instead of guessed.
 DEBUG_HOOK = None
@@ -197,6 +206,19 @@ def names_match(expected: str, actual: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.7
 
 
+def _grab(hwnd: int, layout: Layout):
+    """Capture the window, refusing a capture whose size no longer matches the layout
+    (minimized or resized WeChat): its coordinates would be meaningless."""
+    want = (layout.width, layout.height)
+    image = capture_window(hwnd)
+    if image.size != want:
+        activate(hwnd)
+        image = capture_window(hwnd)
+        if image.size != want:
+            raise UiError(f"微信窗口尺寸变了（{image.size[0]}x{image.size[1]}），需要重新识别布局")
+    return image
+
+
 def same_name(expected: str, shown: str) -> bool:
     """Strict match for names read by the vision model; a cut-off name ("ab...") matches its prefix."""
     a = normalize_for_match(expected)
@@ -224,14 +246,17 @@ def pick_row(rows: list[Row], name: str, sections: tuple[str, ...] | None = None
 
 
 def read_title(hwnd: int, layout: Layout, reader: VisionReader) -> tuple[str, int | None]:
-    return reader.read_title(capture_window(hwnd).crop(layout.header_box))
+    return reader.read_title(_grab(hwnd, layout).crop(layout.header_box))
 
 
 def _verify_title(hwnd: int, layout: Layout, reader: VisionReader, name: str, how: str) -> str:
     title, count = read_title(hwnd, layout, reader)
     _debug("title_check", name=name, title=title, count=count)
     if not same_name(name, title):
-        raise UiError(f"{how}失败：想打开 {name!r}，实际标题 {title!r}")
+        message = f"{how}失败：想打开 {name!r}，实际标题 {title!r}"
+        if title:
+            raise WrongChat(message, f"{title}({count})" if count else title)
+        raise UiError(message)
     return f"{title}({count})" if count else title
 
 
@@ -262,23 +287,31 @@ def _search_popup(hwnd: int, layout: Layout, before: set[int]) -> tuple[int, tup
 
 def _row_selected(hwnd: int, layout: Layout, y: int) -> bool:
     """The clicked session-list row turns green once its chat is open."""
-    image = capture_window(hwnd).convert("RGB")
+    image = _grab(hwnd, layout).convert("RGB")
     x = layout.list_left + 8
     return any(close_color(image.getpixel((x, yy)), SELECTED_ROW, 12) for yy in (y - 10, y, y + 10))
 
 
 def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str | None:
     """Click the chat's row in the visible session list; None when it is not visible."""
-    image = capture_window(hwnd)
     box = (layout.list_left, layout.header_bottom, layout.list_right, layout.height - 10)
-    rows = reader.session_rows(image.crop(box))
-    row = pick_row(rows, name)
-    avatars = find_list_rows(image, layout)
-    y = None
-    if row is not None:
-        top = layout.header_bottom
-        y = snap_to_row(top + row.center[1], avatars, rows.index(row), top + rows[0].center[1])
-    _debug("list_rows", name=name, rows=[(r.name, *r.center) for r in rows], row=row and row.name, avatars=avatars, y=y)
+    for attempt in range(3):
+        image = _grab(hwnd, layout)
+        rows = reader.session_rows(image.crop(box))
+        row = pick_row(rows, name)
+        avatars = find_list_rows(image, layout)
+        y = None
+        if row is not None:
+            top = layout.header_bottom
+            y = snap_to_row(top + row.center[1], avatars, rows.index(row), top + rows[0].center[1])
+        _debug("list_rows", name=name, rows=[(r.name, *r.center) for r in rows], row=row and row.name, avatars=avatars, y=y)
+        # Reading the list takes seconds; a message arriving meanwhile moves its chat to the
+        # top and shifts every row below, so only click a list that still looks the same.
+        if _changed_pixels(image.crop(box), _grab(hwnd, layout).crop(box)) <= 50:
+            break
+        _debug("list_changed", attempt=attempt)
+    else:
+        raise UiError("会话列表一直在变动，稍后再试")
     if y is None:
         return None
     point = ((layout.list_left + layout.list_right) // 2, y)
@@ -321,7 +354,7 @@ def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: s
     if wechat_windows(hwnd):
         dismiss_popups(hwnd, layout)
     region = _input_region(layout)
-    input_before = capture_window(hwnd).crop(region)
+    input_before = _grab(hwnd, layout).crop(region)
     before = set(wechat_windows(hwnd))
     _debug("search_click", point=layout.search_point, screen=to_screen(hwnd, layout.search_point))
     click(hwnd, layout.search_point)
@@ -331,7 +364,7 @@ def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: s
     press(win32con.VK_CONTROL, ord("A"))
     press(win32con.VK_CONTROL, ord("V"))
     time.sleep(1.5)
-    if _changed_pixels(input_before, capture_window(hwnd).crop(region)) > 200:
+    if _changed_pixels(input_before, _grab(hwnd, layout).crop(region)) > 200:
         # The paste went into the chat input box: wipe it before anything can send it.
         click(hwnd, layout.input_point)
         press(win32con.VK_CONTROL, ord("A"))
