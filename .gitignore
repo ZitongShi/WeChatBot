@@ -7,3 +7,5 @@ __pycache__/
 .venv/
 .pytest_cache/
 *.log
+data/relay/
+relay.json
