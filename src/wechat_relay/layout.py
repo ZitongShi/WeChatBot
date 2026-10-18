@@ -42,8 +42,8 @@ class Layout:
 
     @property
     def search_point(self) -> tuple[int, int]:
-        """The magnifier icon at the top of the session list."""
-        return (self.list_right - 92, self.header_top + 35)
+        """Inside the search box, which sits level with the chat title bar."""
+        return (self.list_right - 92, (self.header_top + self.header_bottom) // 2)
 
     @property
     def input_point(self) -> tuple[int, int]:
@@ -232,28 +232,16 @@ def find_list_rows(image: Image.Image, layout: Layout) -> list[int]:
     return centers
 
 
-def snap_to_row(y: int, centers: list[int], index: int | None = None, first_y: int | None = None) -> int | None:
-    """Map a row the vision model located (its y and list position) to an avatar center.
+def align_rows(count: int, centers: list[int], top: int, bottom: int) -> list[int] | None:
+    """Avatar centers for the `count` rows the vision model listed, top to bottom.
 
-    The model's boxes drift more the further down the list, but its order is right: when
-    its first row is the first avatar, the position decides. Otherwise take the nearest
-    avatar, unless the next one is about as near (None: better to search than to click a
-    neighbour). `first_y` is the y of the first row the model listed.
+    Its order is reliable, its coordinates are not. A row cut off at the top or bottom
+    edge may be missing from its list; any other mismatch means the rows cannot be told
+    apart (None: search instead of guessing).
     """
-    if not centers:
-        return None
-    if (
-        index is not None
-        and first_y is not None
-        and index < len(centers)
-        and abs(centers[0] - first_y) <= 30
-        and abs(centers[index] - y) <= 70
-    ):
-        return centers[index]
-    ranked = sorted(centers, key=lambda c: abs(c - y))
-    best = ranked[0]
-    if abs(best - y) > 45:
-        return None
-    if len(ranked) > 1 and abs(ranked[1] - y) - abs(best - y) < 25:
-        return None
-    return best
+    rows = list(centers)
+    if count < len(rows) and rows and rows[0] - top < 20:
+        rows = rows[1:]
+    if count < len(rows) and rows and bottom - rows[-1] < 20:
+        rows = rows[:-1]
+    return rows if count == len(rows) and rows else None

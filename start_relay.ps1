@@ -20,6 +20,11 @@ $console = Join-Path $root "logs\relay_console.log"
 while ($true) {
     "==== start $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -Append -Encoding utf8 $console
     & $python -m wechat_relay run 2>&1 | Tee-Object -Append -FilePath $console
+    if ($LASTEXITCODE -eq 3) {
+        # /停止 from the main account: stay stopped.
+        "==== stopped by command $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -Append -Encoding utf8 $console
+        break
+    }
     "==== exited $LASTEXITCODE $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), restarting in 15s" | Out-File -Append -Encoding utf8 $console
     Start-Sleep -Seconds 15
 }

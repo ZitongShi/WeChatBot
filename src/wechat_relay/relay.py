@@ -39,8 +39,10 @@ HELP_TEXT = "\n".join(
         "1. 引用某条转发消息后直接输入内容 → 回复给对应会话",
         "2. #编号 内容 → 例如：#12 好的",
         "3. /截图 #编号 或 /截图 会话名 → 发来该会话当前的截图（也可以引用转发消息后发 /截图）",
-        "4. /list → 最近转发过的会话",
-        "5. /help → 显示本说明",
+        "4. /暂停 30 → 暂停 30 分钟（不碰鼠标键盘），到点自动恢复；不写分钟数默认 30",
+        "5. /停止 → 关掉 bot，要在电脑上重新启动",
+        "6. /list → 最近转发过的会话",
+        "7. /help → 显示本说明",
     ]
 )
 
@@ -78,6 +80,15 @@ class Command:
     text: str = ""
 
 
+# Exit code that tells start_relay.ps1 the bot was stopped on purpose: do not restart it.
+EXIT_STOPPED = 3
+PAUSE = re.compile(r"^/\s*(暂停|pause)\s*(\d{1,4})?\s*(分钟|min|m)?\s*$", flags=re.IGNORECASE)
+
+
+class StopRequested(Exception):
+    """/停止 from the main account."""
+
+
 SHOT = re.compile(r"^/\s*(截图|截屏|shot|ss)\s*(.*)$", flags=re.IGNORECASE | re.DOTALL)
 
 
@@ -87,6 +98,11 @@ def parse_command(message: ChatMessage) -> Command:
         return Command("list")
     if text.lower() in {"/help", "/h", "help"}:
         return Command("help")
+    if text.lower().replace(" ", "") in {"/停止", "/stop", "/quit", "/exit"}:
+        return Command("stop")
+    pause = PAUSE.match(text)
+    if pause:
+        return Command("pause", text=pause.group(2) or "30")
     shot = SHOT.match(text)
     if shot:
         rest = shot.group(2).strip()
@@ -142,10 +158,13 @@ class Relay:
         # Chats the bot typed into. Messages that arrive while a chat is open never get an
         # unread badge, so each one is re-checked when idle: chat name -> messages-area hash
         # of the last read ("" forces a read).
-        self.revisit: dict[str, str] = {}
+        self.revisit: dict[str, str] = {chat: "" for chat in self.state.retry}
+        self.revisit_failures: dict[str, int] = {}
         # Commands read from the main chat, run one per tick: a command that arrives while
         # another runs waits here instead of being lost.
         self.commands: deque[tuple[str, ChatMessage]] = deque()
+        # While paused (/暂停) the bot does not touch the mouse or keyboard until this time.
+        self.paused_until: float | None = None
         # The chat believed to be open; only trusted after its title is checked again.
         self.current: str | None = None
         # Messages-area hash of the image behind the last read.
@@ -229,6 +248,7 @@ class Relay:
                 self.current = exc.title
                 opened = ui.strip_member_count(exc.title)
                 self.revisit[opened] = ""
+                self.state.mark_retry(opened)
                 self.log("opened_wrong_chat", wanted=name, opened=opened)
             # Keep the scene of every failed navigation for debugging.
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -265,7 +285,8 @@ class Relay:
 
     # ---- main loop -----------------------------------------------------------
 
-    def run(self) -> None:
+    def run(self) -> int:
+        """Relay until stopped; returns the process exit code."""
         place_window(self.hwnd, self.config.window_rect)
         ui.activate(self.hwnd)
         self.wait_for_window_size()
@@ -282,7 +303,10 @@ class Relay:
                 self.tick()
             except KeyboardInterrupt:
                 self.log("stopped")
-                return
+                return 0
+            except StopRequested:
+                self.log("stopped_by_command")
+                return EXIT_STOPPED
             except Exception as exc:
                 self.log("error", error=str(exc), trace=traceback.format_exc()[-800:])
                 time.sleep(3)
@@ -320,6 +344,14 @@ class Relay:
         self.log("bootstrap", chat=chat, visible=len(read.messages))
 
     def tick(self) -> None:
+        if self.paused_until is not None:
+            if time.time() < self.paused_until:
+                return  # not even a screenshot: capturing brings WeChat to the front
+            self.paused_until = None
+            self.log("resumed")
+            self.send_to_main(self.config.forward_to_title, "▶ 暂停结束，bot 已恢复")
+            self.park_if_idle()
+            return
         if self.commands:
             main_chat, message = self.commands.popleft()
             self.handle_command(main_chat, message)
@@ -342,11 +374,21 @@ class Relay:
                 self.open_chat(chat)
             except ui.UiError as exc:
                 self.log("revisit_failed", chat=chat, error=str(exc))
+                failures = self.revisit_failures.get(chat, 0) + 1
+                self.revisit_failures[chat] = failures
+                if chat in self.state.retry:
+                    if failures < 3:
+                        self.revisit[chat] = ""  # unrelayed messages: try again later
+                    else:
+                        self.state.clear_retry(chat)
+                        self.log("retry_given_up", chat=chat)
                 # Never stay in some other chat: messages arriving there get no badge.
                 self.park()
                 return
             if image_hash(self.messages_crop()) != digest:
                 self.handle_open_chat()
+            self.revisit_failures.pop(chat, None)
+            self.state.clear_retry(chat)
             self.park_if_idle()
 
     def park_if_idle(self) -> None:
@@ -368,6 +410,7 @@ class Relay:
             # A failed read must not replace the anchor.
             self.log("empty_read", chat=chat)
             return
+        previous_anchor = list(self.state.anchors.get(chat, []))
         new, complete = self.state.take_new(chat, read.messages)
         self.state.save()
         incoming = [m for m in new if m.side == "L"]
@@ -382,7 +425,15 @@ class Relay:
 
         if any(ui.names_match(name, chat) for name in self.config.ignore_chats):
             return
-        self.forward(chat, is_group, incoming, complete)
+        try:
+            self.forward(chat, is_group, incoming, complete)
+        except Exception:
+            # Not relayed: forget that they were seen, and read the chat again when idle.
+            self.state.anchors[chat] = previous_anchor
+            self.state.mark_retry(chat)
+            self.revisit[chat] = ""
+            self.log("forward_failed_will_retry", chat=chat, count=len(incoming))
+            raise
 
     def transcribe_voices(self, chat: str, read: ChatRead) -> bool:
         """Use WeChat's own 转文字 on new voice bubbles that have no transcript yet."""
@@ -434,6 +485,18 @@ class Relay:
         self.log("command", kind=command.kind, target=command.target_id, text=command.text[:80])
         if command.kind == "help":
             self.send_to_main(main_chat, HELP_TEXT)
+            return
+        if command.kind == "stop":
+            self.send_to_main(main_chat, "⏹ bot 已停止。要重新启动，请在电脑上运行 start_relay.ps1")
+            raise StopRequested()
+        if command.kind == "pause":
+            minutes = max(1, min(int(command.text or 30), 24 * 60))
+            self.paused_until = time.time() + minutes * 60
+            until = datetime.fromtimestamp(self.paused_until)
+            self.send_to_main(main_chat, f"⏸ 暂停 {minutes} 分钟，{until:%H:%M} 自动恢复。期间收到的消息恢复后再转发。")
+            # Leave the main chat: messages there would get no badge while paused.
+            self.park()
+            self.log("paused", minutes=minutes)
             return
         if command.kind == "list":
             recent = self.state.recent_chats()

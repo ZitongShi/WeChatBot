@@ -5,10 +5,10 @@ from wechat_relay.layout import (
     CHAT_BG,
     SELECTED_ROW,
     SESSION_LIST_BG,
+    align_rows,
     detect_layout,
     find_list_rows,
     find_unread_rows,
-    snap_to_row,
 )
 from wechat_relay.relay import Command, format_forward, parse_command
 from wechat_relay.store import RelayState, split_after_anchor
@@ -162,10 +162,19 @@ def test_list_rows_found_from_avatars_and_snapped():
     layout = detect_layout(img)
     centers = find_list_rows(img, layout)
     assert centers == [150, 231, 312]
-    assert snap_to_row(205, centers) == 231 and snap_to_row(700, centers) is None
-    assert snap_to_row(190, centers) is None  # about halfway between two rows
-    assert snap_to_row(270, centers, index=2, first_y=155) == 312  # position wins over drifted boxes
-    assert snap_to_row(270, centers, index=2, first_y=200) is None  # first rows disagree
+    top, bottom = layout.header_bottom, layout.height - 10
+    assert align_rows(3, centers, top, bottom) == [150, 231, 312]
+    assert align_rows(4, centers, top, bottom) is None  # the model saw a row that is not there
+    assert align_rows(2, [top + 6] + centers[1:], top, bottom) == [231, 312]  # sliver at the top
+    assert align_rows(2, centers[:2] + [bottom - 5], top, bottom) == [150, 231]  # sliver at the bottom
+    assert align_rows(2, centers, top, bottom) is None  # a full row is missing: ambiguous
+
+
+def test_parse_session_lines():
+    from wechat_relay.vision import parse_session_lines
+
+    text = "```\nzitong\tssh-ed25519 AAAA...\n[UnderWay] CVPR27-FGL Bac...\tok\n\n文件传输助手\t\n```"
+    assert parse_session_lines(text) == ["zitong", "[UnderWay] CVPR27-FGL Bac...", "文件传输助手"]
 
 
 def test_fix_sides_trusts_pixels_over_the_model():
@@ -261,7 +270,9 @@ class FakeRelay:
         self.relay = r = Relay.__new__(Relay)
         r.state = RelayState(path=tmp_path / "s.json")
         r.revisit = {}
+        r.revisit_failures = {}
         r.commands = deque()
+        r.paused_until = None
         r.current = None
         r.read_hash = ""
         r.layout = object()
@@ -343,6 +354,7 @@ def test_wrong_chat_is_queued_for_reading(tmp_path):
 
     relay = Relay.__new__(Relay)
     relay.revisit = {}
+    relay.state = RelayState(path=tmp_path / "s.json")
     relay.layout = object()
     relay.hwnd = 0
     relay.vision = None
@@ -364,3 +376,78 @@ def test_wrong_chat_is_queued_for_reading(tmp_path):
     finally:
         ui.open_chat = original
     assert relay.revisit == {"李雷": ""} and relay.current == "李雷"
+
+
+def test_failed_forward_keeps_messages_unseen(tmp_path, monkeypatch):
+    fake = FakeRelay(tmp_path, monkeypatch, [])
+    relay = fake.relay
+    relay.state.take_new("李雷", [msg("哦哦")])
+
+    def broken(*args):
+        raise RuntimeError("没有找到搜索结果弹窗")
+
+    relay.forward = broken
+    read = chat_read("李雷", msg("哦哦"), msg("你好"), msg("在吗"))
+    try:
+        relay.process_read(read)
+    except RuntimeError:
+        pass
+    assert relay.revisit == {"李雷": ""}
+    assert RelayState.load(tmp_path / "s.json").retry == ["李雷"]  # survives a restart
+    # Next time the same messages are still new.
+    relay.forward = lambda chat, is_group, messages, complete: fake.forwards.append([m.text for m in messages])
+    relay.process_read(read)
+    assert fake.forwards == [["你好", "在吗"]]
+
+
+def test_search_point_is_inside_the_title_band():
+    layout = detect_layout(synthetic_window())
+    x, y = layout.search_point
+    assert layout.header_top < y < layout.header_bottom and layout.list_left < x < layout.list_right
+
+
+def test_parse_stop_and_pause():
+    assert parse_command(msg("/停止")) == Command("stop")
+    assert parse_command(msg("/stop")) == Command("stop")
+    assert parse_command(msg("/暂停")) == Command("pause", text="30")
+    assert parse_command(msg("/暂停 45")) == Command("pause", text="45")
+    assert parse_command(msg("/pause 10 min")) == Command("pause", text="10")
+    assert parse_command(msg("#3 停止")).kind == "reply"  # without the slash it is a reply
+
+
+def test_stop_command_acknowledges_then_stops(tmp_path, monkeypatch):
+    from wechat_relay.relay import StopRequested
+
+    fake = FakeRelay(tmp_path, monkeypatch, [chat_read("zitong", msg("/停止"), msg("⏹ bot 已停止", side="R"))])
+    try:
+        fake.relay.handle_command("zitong", msg("/停止"))
+        raise AssertionError("expected StopRequested")
+    except StopRequested:
+        pass
+    assert fake.sent == [("zitong", "⏹ bot 已停止。要重新启动，请在电脑上运行 start_relay.ps1")]
+
+
+def test_pause_keeps_hands_off_until_it_ends(tmp_path, monkeypatch):
+    import time as _time
+
+    fake = FakeRelay(
+        tmp_path,
+        monkeypatch,
+        [
+            chat_read("zitong", msg("/暂停 5"), msg("⏸ 暂停 5 分钟", side="R")),
+            chat_read("zitong", msg("/暂停 5"), msg("▶ 暂停结束", side="R")),
+        ],
+    )
+    relay = fake.relay
+    relay.paused_until = None
+    relay.handle_command("zitong", msg("/暂停 5"))
+    assert relay.current == "文件传输助手" and relay.paused_until > _time.time() + 290
+
+    relay.capture = lambda: (_ for _ in ()).throw(AssertionError("touched the screen while paused"))
+    relay.tick()  # paused: nothing happens
+    assert len(fake.sent) == 1
+
+    relay.paused_until = _time.time() - 1
+    relay.tick()
+    assert relay.paused_until is None and fake.sent[-1] == ("zitong", "▶ 暂停结束，bot 已恢复")
+    assert relay.current == "文件传输助手"

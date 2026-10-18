@@ -34,7 +34,14 @@ def find_main_window() -> int:
     win32gui.EnumWindows(callback, None)
     if not found:
         raise RuntimeError("未找到微信主窗口（标题为“微信”的 Qt 窗口），请先登录微信")
-    hwnd = found[0]
+
+    def area(hwnd: int) -> int:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        return (right - left) * (bottom - top)
+
+    # A second WeChat instance (多开) waiting at its small login box has the same title and
+    # class; the logged-in main window is by far the largest.
+    hwnd = max(found, key=area)
     if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
         # Hidden to the tray or minimized: bring it back, PrintWindow needs it rendered.
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)

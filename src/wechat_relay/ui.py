@@ -9,7 +9,7 @@ import win32con
 import win32gui
 import win32process
 
-from .layout import SELECTED_ROW, Layout, close_color, find_list_rows, snap_to_row
+from .layout import SELECTED_ROW, Layout, align_rows, close_color, find_list_rows
 from .screen import OcrLine, capture_screen, capture_window, ocr_lines, window_rect
 from .vision import Row, VisionReader, normalize_for_match
 
@@ -297,21 +297,23 @@ def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: s
     box = (layout.list_left, layout.header_bottom, layout.list_right, layout.height - 10)
     for attempt in range(3):
         image = _grab(hwnd, layout)
-        rows = reader.session_rows(image.crop(box))
-        row = pick_row(rows, name)
+        names = reader.session_names(image.crop(box))
+        if not names:
+            # An empty answer is a failed read (the list is never empty): ask again.
+            _debug("list_rows_empty", attempt=attempt)
+            continue
+        index = next((i for i, shown in enumerate(names) if same_name(name, shown)), None)
         avatars = find_list_rows(image, layout)
-        y = None
-        if row is not None:
-            top = layout.header_bottom
-            y = snap_to_row(top + row.center[1], avatars, rows.index(row), top + rows[0].center[1])
-        _debug("list_rows", name=name, rows=[(r.name, *r.center) for r in rows], row=row and row.name, avatars=avatars, y=y)
+        aligned = align_rows(len(names), avatars, layout.header_bottom, box[3])
+        y = aligned[index] if aligned and index is not None else None
+        _debug("list_rows", name=name, names=names, index=index, avatars=avatars, y=y)
         # Reading the list takes seconds; a message arriving meanwhile moves its chat to the
         # top and shifts every row below, so only click a list that still looks the same.
         if _changed_pixels(image.crop(box), _grab(hwnd, layout).crop(box)) <= 50:
             break
         _debug("list_changed", attempt=attempt)
     else:
-        raise UiError("会话列表一直在变动，稍后再试")
+        raise UiError("会话列表读不出来或一直在变动，稍后再试")
     if y is None:
         return None
     point = ((layout.list_left + layout.list_right) // 2, y)

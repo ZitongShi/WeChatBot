@@ -89,8 +89,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .config import load_relay_config
     from .relay import Relay
 
-    Relay(load_relay_config(args.config)).run()
-    return 0
+    return Relay(load_relay_config(args.config)).run()
 
 
 def main(argv: list[str] | None = None) -> int:

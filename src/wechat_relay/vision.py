@@ -224,12 +224,27 @@ def parse_rows(data: dict[str, Any], size: tuple[int, int]) -> list[Row]:
     return rows
 
 
-SESSIONS_PROMPT = """This is the session list of the WeChat desktop app: one row per chat, each with an
-avatar, a bold name, a timestamp and a gray preview line.
-Return JSON only: {"rows": [{"name": str, "box": [x1,y1,x2,y2]}]}
-- One entry per row, top to bottom, including partly visible rows at the edges.
-- name: the bold chat name exactly as shown (keep a trailing "..." if it is cut off). Never the preview text.
-- box: the whole row, in 0-1000 coordinates relative to this image."""
+# Plain lines, not JSON: the model pretty-prints JSON until it runs out of tokens. Its
+# coordinates are unusable here, but its order is right, so rows are mapped to avatars.
+SESSIONS_PROMPT = """This is the session list of the WeChat desktop app. Every row has an avatar, a bold chat
+name with a timestamp on the right, and a gray preview line under the name.
+Output one line per row, top to bottom, and nothing else:
+name<TAB>preview
+- name: the bold chat name exactly as shown (keep a trailing "..." if it is cut off).
+- preview: the gray line under it ("" if none). It belongs to the same row: never a row of its own.
+Include rows cut off at the top or bottom edge."""
+
+
+def parse_session_lines(content: str) -> list[str]:
+    names: list[str] = []
+    for line in str(content or "").splitlines():
+        line = line.strip().strip("`")
+        if not line or line.lower() in {"name\tpreview", "text", "tsv"}:
+            continue
+        name = line.split("\t")[0].strip().strip('"')
+        if name:
+            names.append(name)
+    return names
 
 SEARCH_PROMPT = """This is the WeChat desktop search-result popup. Results are grouped under gray section
 headers such as 联系人, 群聊, 功能, 最常使用, 搜索网络结果, 聊天记录.
@@ -254,6 +269,9 @@ class VisionReader:
         self.timeout = timeout
 
     def _ask(self, prompt: str, image: Image.Image, max_tokens: int) -> dict[str, Any]:
+        return parse_json_object(self._complete(prompt, image, max_tokens))
+
+    def _complete(self, prompt: str, image: Image.Image, max_tokens: int) -> str:
         payload = {
             "model": self.model,
             "temperature": 0,
@@ -279,7 +297,7 @@ class VisionReader:
                 )
                 if res.status_code >= 400:
                     raise RuntimeError(f"vision {res.status_code}: {res.text[:200]}")
-                return parse_json_object(res.json()["choices"][0]["message"]["content"])
+                return str(res.json()["choices"][0]["message"]["content"] or "")
             except (requests.RequestException, RuntimeError, KeyError, IndexError) as exc:
                 last_error = exc
         raise RuntimeError(f"视觉模型调用失败: {last_error}")
@@ -294,8 +312,9 @@ class VisionReader:
         data = self._ask(TITLE_PROMPT, image, 100)
         return _split_title(data.get("title"), data.get("member_count"))
 
-    def session_rows(self, image: Image.Image) -> list[Row]:
-        return parse_rows(self._ask(SESSIONS_PROMPT, image, 800), image.size)
+    def session_names(self, image: Image.Image) -> list[str]:
+        """Chat names in the session list, top to bottom."""
+        return parse_session_lines(self._complete(SESSIONS_PROMPT, image, 1200))
 
     def search_rows(self, image: Image.Image) -> list[Row]:
-        return parse_rows(self._ask(SEARCH_PROMPT, image, 800), image.size)
+        return parse_rows(self._ask(SEARCH_PROMPT, image, 1500), image.size)

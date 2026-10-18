@@ -19,6 +19,8 @@ class RelayState:
     next_id: int = 1
     forwards: dict[str, dict] = field(default_factory=dict)
     anchors: dict[str, list[str]] = field(default_factory=dict)
+    # Chats whose new messages were seen but not relayed: read again, even after a restart.
+    retry: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, path: Path) -> "RelayState":
@@ -30,13 +32,24 @@ class RelayState:
             next_id=int(data.get("next_id", 1)),
             forwards=dict(data.get("forwards", {})),
             anchors={k: list(v) for k, v in data.get("anchors", {}).items()},
+            retry=[str(v) for v in data.get("retry", [])],
         )
 
     def save(self) -> None:
-        data = {"next_id": self.next_id, "forwards": self.forwards, "anchors": self.anchors}
+        data = {"next_id": self.next_id, "forwards": self.forwards, "anchors": self.anchors, "retry": self.retry}
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.path)
+
+    def mark_retry(self, chat: str) -> None:
+        if chat not in self.retry:
+            self.retry.append(chat)
+        self.save()
+
+    def clear_retry(self, chat: str) -> None:
+        if chat in self.retry:
+            self.retry.remove(chat)
+            self.save()
 
     def new_forward(self, chat: str, is_group: bool) -> int:
         fid = self.next_id
