@@ -321,8 +321,8 @@ def test_reply_relays_messages_that_arrived_in_the_target(tmp_path, monkeypatch)
     assert fake.sent[0] == ("李雷", "好的")
     assert fake.forwards == [("李雷", ["我是大神", "你是什么", "你叫什么名字"])]
     assert fake.sent[-1][0] == "zitong" and fake.sent[-1][1].startswith("✓ 已回复")
-    # Both chats the bot typed into are re-checked against the image of the read after typing.
-    assert set(relay.revisit) == {"李雷", "zitong"}
+    # Nothing to re-check: no screen change was seen before leaving either chat.
+    assert relay.revisit == {}
 
 
 def test_command_arriving_while_another_runs_is_queued(tmp_path, monkeypatch):
@@ -363,7 +363,7 @@ def test_wrong_chat_is_queued_for_reading(tmp_path):
     relay.log = lambda event, **data: None
     relay.capture = lambda: None
 
-    def wrong(*args):
+    def wrong(*args, **kwargs):
         raise ui.WrongChat("x", "李雷")
 
     original = ui.open_chat
@@ -451,3 +451,61 @@ def test_pause_keeps_hands_off_until_it_ends(tmp_path, monkeypatch):
     relay.tick()
     assert relay.paused_until is None and fake.sent[-1] == ("zitong", "▶ 暂停结束，bot 已恢复")
     assert relay.current == "文件传输助手"
+
+
+def test_leaving_a_changed_chat_schedules_a_read(tmp_path, monkeypatch):
+    from wechat_relay.layout import Layout
+    from wechat_relay.relay import image_hash
+
+    fake = FakeRelay(tmp_path, monkeypatch, [])
+    relay = fake.relay
+    relay.layout = Layout(width=100, height=100, list_left=0, list_right=20, chat_left=20, chat_right=100,
+                          header_top=0, header_bottom=10, input_top=80)
+    before = Image.new("RGB", (100, 100), (250, 250, 250))
+    relay.read_chat, relay.read_hash = "李雷", image_hash(before.crop(relay.layout.messages_box))
+    relay.note_leaving("李雷", before)
+    assert relay.revisit == {}
+    after = before.copy()
+    ImageDraw.Draw(after).rectangle((30, 40, 60, 50), fill=(255, 255, 255))  # a new bubble
+    relay.note_leaving("文件传输助手", after)  # a different chat was open: not comparable
+    assert relay.revisit == {}
+    relay.note_leaving("李雷", after)
+    assert relay.revisit == {"李雷": ""}
+
+
+def test_main_chat_text_of_any_type_is_a_command(tmp_path, monkeypatch):
+    fake = FakeRelay(tmp_path, monkeypatch, [chat_read("zitong", msg("x"))])
+    relay = fake.relay
+    seen = []
+    relay.send_to_main = lambda chat, text, image=None: seen.append(text)
+    relay.handle_command("zitong", msg("/help", kind="other"))
+    assert seen and seen[0].startswith("【转发助手】")
+    relay.handle_command("zitong", msg("截图.png", kind="image"))
+    assert len(seen) == 1  # an image's description is never a command
+
+
+def test_login_box_is_not_the_main_window():
+    from wechat_relay.screen import looks_logged_in
+
+    assert looks_logged_in(935, 1014) and looks_logged_in(1936, 1048)
+    assert not looks_logged_in(442, 581) and not looks_logged_in(296, 388)
+
+
+def test_waits_quietly_while_logged_out(tmp_path, monkeypatch):
+    from wechat_relay import relay as relay_module
+
+    fake = FakeRelay(tmp_path, monkeypatch, [])
+    relay = fake.relay
+    windows = iter([None, None, 4242])
+    sleeps = []
+    calls = []
+    monkeypatch.setattr(relay_module, "find_logged_in_window", lambda: next(windows))
+    monkeypatch.setattr(relay_module.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(relay_module, "show_window", lambda h: calls.append("show"))
+    monkeypatch.setattr(relay_module, "place_window", lambda h, rect: calls.append("place"))
+    monkeypatch.setattr(relay_module.ui, "activate", lambda h: calls.append("activate"))
+    relay.config.window_rect = None
+    relay.wait_for_login(poll_sec=30)
+    assert sleeps[:2] == [30, 30]  # polled twice without touching anything
+    assert relay.hwnd == 4242 and calls[:3] == ["show", "place", "activate"]
+    assert relay.current == "文件传输助手"  # parked again

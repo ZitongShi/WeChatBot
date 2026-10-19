@@ -23,8 +23,23 @@ def enable_dpi_awareness() -> None:
             pass
 
 
-def find_main_window() -> int:
-    """The WeChat 4.x main window is the Qt window titled exactly '微信'."""
+# The QR-code login box is about 440x580; the main window cannot be made that small.
+MIN_MAIN_SIZE = (600, 450)
+
+
+def looks_logged_in(width: int, height: int) -> bool:
+    return width >= MIN_MAIN_SIZE[0] and height >= MIN_MAIN_SIZE[1]
+
+
+def _restored_size(hwnd: int) -> tuple[int, int]:
+    """Window size as when restored, also for minimized or tray-hidden windows."""
+    left, top, right, bottom = win32gui.GetWindowPlacement(hwnd)[4]
+    return right - left, bottom - top
+
+
+def find_logged_in_window() -> int | None:
+    """The WeChat 4.x main window (a Qt window titled exactly '微信'), or None when only the
+    login box is there (logged out) or WeChat is not running. Has no side effects."""
     found: list[int] = []
 
     def callback(hwnd: int, _: object) -> None:
@@ -32,20 +47,29 @@ def find_main_window() -> int:
             found.append(hwnd)
 
     win32gui.EnumWindows(callback, None)
-    if not found:
-        raise RuntimeError("未找到微信主窗口（标题为“微信”的 Qt 窗口），请先登录微信")
+    # A second WeChat instance (多开) waiting at its login box has the same title and class.
+    main = [h for h in found if looks_logged_in(*_restored_size(h))]
+    if not main:
+        return None
+    return max(main, key=lambda h: _restored_size(h)[0] * _restored_size(h)[1])
 
-    def area(hwnd: int) -> int:
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        return (right - left) * (bottom - top)
 
-    # A second WeChat instance (多开) waiting at its small login box has the same title and
-    # class; the logged-in main window is by far the largest.
-    hwnd = max(found, key=area)
+def is_logged_in_window(hwnd: int) -> bool:
+    return bool(hwnd) and bool(win32gui.IsWindow(hwnd)) and looks_logged_in(*_restored_size(hwnd))
+
+
+def show_window(hwnd: int) -> None:
     if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
-        # Hidden to the tray or minimized: bring it back, PrintWindow needs it rendered.
+        # Hidden to the tray or minimized: bring it back so it can be captured.
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+
+
+def find_main_window() -> int:
+    hwnd = find_logged_in_window()
+    if hwnd is None:
+        raise RuntimeError("未找到已登录的微信主窗口，请先登录微信")
+    show_window(hwnd)
     return hwnd
 
 

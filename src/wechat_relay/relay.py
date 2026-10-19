@@ -15,7 +15,7 @@ from wechat_customer_bot.log import JsonlLogger
 from . import ui
 from .config import RelayConfig
 from .layout import Layout, detect_layout, find_unread_rows
-from .screen import capture_window, find_main_window, place_window, window_rect
+from .screen import capture_window, find_logged_in_window, is_logged_in_window, place_window, show_window, window_rect
 from .store import RelayState
 from .vision import ChatMessage, ChatRead, VisionReader
 
@@ -29,6 +29,10 @@ TYPE_LABELS = {
     "sticker": "表情",
     "other": "消息",
 }
+
+# Message types whose text is a description or a file name, never something typed. The vision
+# model sometimes calls a typed reply "other", so everything else with text is a command.
+NOT_COMMANDS = {"image", "video", "sticker", "file", "link", "voice", "system"}
 
 REPLY_ID = re.compile(r"#\s*(\d{1,6})")
 # Our own forward header ("#12【群】…") showing up as message text means it is a quote.
@@ -151,7 +155,12 @@ class Relay:
         self.logger = JsonlLogger(config.log_file)
         self.state = RelayState.load(config.state_file)
         self.vision = VisionReader(config.llm_base_url, config.llm_api_key, config.vision_model)
-        self.hwnd = find_main_window()
+        # 0 while WeChat is logged out: run() waits for the main window to come back.
+        self.hwnd = find_logged_in_window() or 0
+        # Consecutive failed ticks, for backing off instead of retrying every few seconds.
+        self.failures = 0
+        # The chat behind `read_hash` (the last read).
+        self.read_chat = ""
         self.layout: Layout | None = None
         if config.save_debug_screens:
             ui.DEBUG_HOOK = self.debug_step
@@ -213,11 +222,13 @@ class Relay:
         assert self.layout is not None
         crop = image.crop(self.layout.chat_box)
         self.read_hash = image_hash(image.crop(self.layout.messages_box))
+        self.read_chat = ""
         self.save_debug(crop, "chat")
         read = self.vision.read_chat(crop)
         read.messages = attach_split_quotes(read.messages)
         if read.title:
             self.current = f"{read.title}({read.member_count})" if read.member_count else read.title
+            self.read_chat = read.title
         return read
 
     def messages_point(self, message: ChatMessage) -> tuple[int, int] | None:
@@ -237,10 +248,13 @@ class Relay:
             if ui.same_name(name, title):
                 self.log("open_chat", name=name, already_open=True)
                 return f"{title}({count})" if count else title
+        leaving = self.current
         self.current = None
         self.log("open_chat", name=name)
         try:
-            self.current = ui.open_chat(self.hwnd, self.layout, self.vision, name)
+            self.current = ui.open_chat(
+                self.hwnd, self.layout, self.vision, name, on_leave=lambda image: self.note_leaving(leaving, image)
+            )
             return self.current
         except ui.UiError as exc:
             if isinstance(exc, ui.WrongChat):
@@ -258,11 +272,25 @@ class Relay:
                 pass
             raise
 
+    def note_leaving(self, chat: str | None, image: Image.Image) -> None:
+        """Called right before the bot clicks away from `chat`.
+
+        Messages arriving in the open chat get no unread badge. If the chat changed since
+        the bot last read it, read it again when idle; otherwise there is nothing to re-check.
+        """
+        if not chat or not self.read_chat or self.layout is None:
+            return
+        if not ui.same_name(self.read_chat, ui.strip_member_count(chat)):
+            return
+        if image_hash(image.crop(self.layout.messages_box)) != self.read_hash:
+            self.revisit[self.read_chat] = ""
+            self.log("left_with_changes", chat=self.read_chat)
+
     def type_in(self, chat: str, text: str, images: list[Image.Image] | None = None) -> ChatRead:
         """Send into the open chat, then read it right away and relay what is new.
 
         Messages that arrived while the bot was busy are in this read; anything later
-        changes the messages area, so the idle re-check (`revisit`) catches it.
+        changes the messages area, which `note_leaving` checks before the bot moves on.
         """
         assert self.layout is not None
         if text:
@@ -270,7 +298,6 @@ class Relay:
         for image in images or []:
             ui.send_image(self.hwnd, self.layout, image)
         read = self.read_current_chat()
-        self.revisit[chat] = self.read_hash
         self.process_read(read)
         return read
 
@@ -287,6 +314,8 @@ class Relay:
 
     def run(self) -> int:
         """Relay until stopped; returns the process exit code."""
+        if not is_logged_in_window(self.hwnd):
+            self.wait_for_login()
         place_window(self.hwnd, self.config.window_rect)
         ui.activate(self.hwnd)
         self.wait_for_window_size()
@@ -301,6 +330,7 @@ class Relay:
         while True:
             try:
                 self.tick()
+                self.failures = 0
             except KeyboardInterrupt:
                 self.log("stopped")
                 return 0
@@ -309,7 +339,13 @@ class Relay:
                 return EXIT_STOPPED
             except Exception as exc:
                 self.log("error", error=str(exc), trace=traceback.format_exc()[-800:])
-                time.sleep(3)
+                if not is_logged_in_window(self.hwnd):
+                    self.wait_for_login()
+                    continue
+                # Retrying grabs the foreground (a synthetic Alt press), so back off:
+                # 3 s, 6 s, 12 s ... up to 2 minutes while the failure persists.
+                self.failures += 1
+                time.sleep(min(3 * 2 ** (self.failures - 1), 120))
                 try:
                     self.layout = None
                     self.capture()
@@ -317,6 +353,31 @@ class Relay:
                 except Exception:
                     pass
             time.sleep(self.config.poll_interval_sec)
+
+    def wait_for_login(self, poll_sec: float = 30.0) -> None:
+        """WeChat is logged out (only the QR-code box is left) or not running.
+
+        Wait without touching the mouse or keyboard; once someone logs in again, carry on.
+        Messages that arrived meanwhile still show unread badges.
+        """
+        self.log("wechat_logged_out")
+        while True:
+            hwnd = find_logged_in_window()
+            if hwnd:
+                break
+            time.sleep(poll_sec)
+        time.sleep(5)  # let the freshly logged-in window finish loading
+        self.hwnd = hwnd
+        self.layout = None
+        self.current = None
+        self.read_chat = ""
+        self.failures = 0
+        show_window(hwnd)
+        place_window(hwnd, self.config.window_rect)
+        ui.activate(hwnd)
+        self.wait_for_window_size()
+        self.log("wechat_logged_in")
+        self.park()
 
     def wait_for_window_size(self, timeout: float = 8.0) -> None:
         """WeChat applies a resize asynchronously; wait until the rect matches and settles."""
@@ -474,7 +535,7 @@ class Relay:
         self.type_in(main, text, images)
 
     def handle_command(self, main_chat: str, message: ChatMessage) -> None:
-        if message.type != "text":
+        if message.type in NOT_COMMANDS or not message.text.strip():
             self.log("command_skipped_non_text", type=message.type, text=message.text[:40])
             return
         if FORWARD_QUOTE.search(message.text):

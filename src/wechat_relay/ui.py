@@ -292,7 +292,7 @@ def _row_selected(hwnd: int, layout: Layout, y: int) -> bool:
     return any(close_color(image.getpixel((x, yy)), SELECTED_ROW, 12) for yy in (y - 10, y, y + 10))
 
 
-def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str | None:
+def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: str, on_leave=None) -> str | None:
     """Click the chat's row in the visible session list; None when it is not visible."""
     box = (layout.list_left, layout.header_bottom, layout.list_right, layout.height - 10)
     for attempt in range(3):
@@ -309,7 +309,8 @@ def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: s
         _debug("list_rows", name=name, names=names, index=index, avatars=avatars, y=y)
         # Reading the list takes seconds; a message arriving meanwhile moves its chat to the
         # top and shifts every row below, so only click a list that still looks the same.
-        if _changed_pixels(image.crop(box), _grab(hwnd, layout).crop(box)) <= 50:
+        latest = _grab(hwnd, layout)
+        if _changed_pixels(image.crop(box), latest.crop(box)) <= 50:
             break
         _debug("list_changed", attempt=attempt)
     else:
@@ -317,6 +318,9 @@ def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: s
     if y is None:
         return None
     point = ((layout.list_left + layout.list_right) // 2, y)
+    if on_leave is not None:
+        # The chat being left, as it looks right before it stops being the open one.
+        on_leave(latest)
     _debug("list_click", point=point, screen=to_screen(hwnd, point))
     click(hwnd, point)
     time.sleep(1.0)
@@ -331,20 +335,20 @@ def open_chat_from_list(hwnd: int, layout: Layout, reader: VisionReader, name: s
     return _verify_title(hwnd, layout, reader, name, "点击会话列表")
 
 
-def open_chat(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str:
+def open_chat(hwnd: int, layout: Layout, reader: VisionReader, name: str, on_leave=None) -> str:
     """Open a chat: click its row in the session list, else fall back to searching.
 
     Returns the header title ("群名(32)" for groups); raises unless it is exactly the name.
     """
     close_chat_popouts(hwnd)
     ensure_foreground(hwnd)
-    title = open_chat_from_list(hwnd, layout, reader, name)
+    title = open_chat_from_list(hwnd, layout, reader, name, on_leave)
     if title is not None:
         return title
-    return open_chat_by_search(hwnd, layout, reader, name)
+    return open_chat_by_search(hwnd, layout, reader, name, on_leave)
 
 
-def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: str) -> str:
+def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: str, on_leave=None) -> str:
     """Open a chat via the search box; returns the header title, raises if it does not match.
 
     Guards against typing into the current chat: the result popup must sit right under the
@@ -388,6 +392,8 @@ def open_chat_by_search(hwnd: int, layout: Layout, reader: VisionReader, name: s
     if not (0 <= cx <= box[2] - box[0] and 0 <= cy <= box[3] - box[1]):
         dismiss_popups(hwnd, layout)
         raise UiError("搜索结果位置异常")
+    if on_leave is not None:
+        on_leave(_grab(hwnd, layout))  # the popup only covers the session list
     _debug("result_click", screen=(box[0] + cx, box[1] + cy))
     click_screen(box[0] + cx, box[1] + cy)
     time.sleep(1.2)
